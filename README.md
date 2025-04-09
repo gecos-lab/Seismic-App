@@ -71,7 +71,7 @@ If SAM2 modules are not available, the application will run in demo mode. This m
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the GNU.
 
 ## Acknowledgments
 
