@@ -17,8 +17,8 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 # Add parent directory to path for importing our modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from seismic_app.segy_loader import SegyLoader
-from seismic_app.seismic_predictor import SeismicPredictor
+from segy_loader import SegyLoader
+from seismic_predictor import SeismicPredictor
 
 # Import PyVista for 3D visualization
 try:
