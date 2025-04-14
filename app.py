@@ -75,9 +75,10 @@ class SeismicApp(ttk.Frame):
         self.current_slice_idx = tk.IntVar(value=0)
         self.current_object_id = tk.IntVar(value=1)
         
-        # Initialize point collection for annotations
-        self.points = []
-        self.point_labels = []
+        # Initialize point collection per object ID
+        self.object_annotations = {} # Stores {'points': [], 'labels': []} for each object ID
+        
+        # Add back the drawing_mode initialization
         self.drawing_mode = tk.StringVar(value="foreground")  # or "background"
         
         # Status variables
@@ -173,8 +174,11 @@ class SeismicApp(ttk.Frame):
                        value="background").pack(side=tk.LEFT, padx=5)
         
         ttk.Label(annot_frame, text="Object ID:").pack(side=tk.LEFT, padx=(10, 5))
-        ttk.Spinbox(annot_frame, from_=1, to=10, width=3, 
-                   textvariable=self.current_object_id).pack(side=tk.LEFT, padx=5)
+        self.object_id_spinbox = ttk.Spinbox(annot_frame, from_=1, to=10, width=3, 
+                                            textvariable=self.current_object_id,
+                                            command=self._on_object_id_change) # Add command
+        self.object_id_spinbox.pack(side=tk.LEFT, padx=5)
+        self.object_id_spinbox.bind("<Return>", self._on_object_id_change) # Bind Return key
         
         # Action buttons
         action_frame = ttk.Frame(control_frame)
@@ -233,16 +237,19 @@ class SeismicApp(ttk.Frame):
         if event.xdata is None or event.ydata is None:
             return  # Click outside the plot area
             
+        # Get annotations for the current object ID
+        points, point_labels = self._get_current_annotations()
+        
         # Add the point and label
-        self.points.append([event.xdata, event.ydata])
+        points.append([event.xdata, event.ydata])
         label = 1 if self.drawing_mode.get() == "foreground" else 0
-        self.point_labels.append(label)
+        point_labels.append(label)
         
         # Update the display
         self._update_display_with_points()
-        
+    
     def _update_display_with_points(self):
-        """Update the display with current slice and annotation points"""
+        """Update the display with current slice and annotation points for ALL objects."""
         if not hasattr(self, 'current_slice') or self.current_slice is None:
             return
             
@@ -253,20 +260,42 @@ class SeismicApp(ttk.Frame):
         vmin, vmax = np.percentile(self.current_slice, [5, 95])
         self.ax.imshow(self.current_slice, cmap='gray', vmin=vmin, vmax=vmax, aspect='auto')
         
-        # Add foreground points (red)
-        fg_points = [p for i, p in enumerate(self.points) if self.point_labels[i] == 1]
-        if fg_points:
-            fg_points = np.array(fg_points)
-            self.ax.scatter(fg_points[:, 0], fg_points[:, 1], color='red', marker='o', s=30)
+        # Get current object ID for highlighting
+        current_obj_id = self.current_object_id.get()
+        colors = plt.get_cmap('tab10').colors # Use consistent colors
+        
+        # Iterate through all object IDs that have annotations
+        for obj_id, annotations in self.object_annotations.items():
+            points = annotations['points']
+            point_labels = annotations['labels']
             
-        # Add background points (blue)
-        bg_points = [p for i, p in enumerate(self.points) if self.point_labels[i] == 0]
-        if bg_points:
-            bg_points = np.array(bg_points)
-            self.ax.scatter(bg_points[:, 0], bg_points[:, 1], color='blue', marker='o', s=30)
+            if not points: # Skip if no points for this object
+                continue
+                
+            obj_color = colors[ (obj_id - 1) % len(colors) ]
+            is_current = (obj_id == current_obj_id)
+            marker_size = 40 if is_current else 25 # Make current object points larger
+            alpha = 1.0 if is_current else 0.7 # Make other objects slightly transparent
             
-        # Update title
-        self.ax.set_title(f"{self.current_slice_type.get().capitalize()} {self.current_slice_idx.get()}")
+            # Add foreground points for this object
+            fg_points = [p for i, p in enumerate(points) if point_labels[i] == 1]
+            if fg_points:
+                fg_points = np.array(fg_points)
+                self.ax.scatter(fg_points[:, 0], fg_points[:, 1], 
+                                color=obj_color, marker='o', s=marker_size, alpha=alpha,
+                                label=f'Obj {obj_id} FG' if is_current else f'_Obj {obj_id} FG') # Underscore hides from legend unless current
+                
+            # Add background points for this object
+            bg_points = [p for i, p in enumerate(points) if point_labels[i] == 0]
+            if bg_points:
+                bg_points = np.array(bg_points)
+                self.ax.scatter(bg_points[:, 0], bg_points[:, 1], 
+                                color=obj_color, marker='x', s=marker_size, alpha=alpha,
+                                label=f'Obj {obj_id} BG' if is_current else f'_Obj {obj_id} BG')
+                                
+        # Update title - Indicate the *active* object ID
+        self.ax.set_title(f"{self.current_slice_type.get().capitalize()} {self.current_slice_idx.get()} (Active Object: {current_obj_id})")
+        self.ax.legend() # Show legend (only for current object due to underscore)
         
         # Redraw canvas
         self.canvas.draw()
@@ -424,155 +453,58 @@ class SeismicApp(ttk.Frame):
             # Set current slice in predictor
             self.predictor.set_current_slice(slice_type, idx, self.current_slice)
             
-            # If there's a propagated mask available, try to load it
-            if self.predictor.demo_mode and hasattr(self.predictor, 'demo_inference_state'):
-                print(f"Checking for demo mask")
+            # --- Attempt to display slice with all relevant masks ---
+            current_obj_id = self.current_object_id.get()
+            mask_for_current = None
+            try:
+                # Determine frame position (assuming slice_idx == frame_pos for now)
+                # A more robust mapping might be needed depending on propagation implementation
+                frame_pos = idx 
                 
-                try:
-                    # In demo mode, we just need to find the frame position
-                    frame_pos = idx  # First try the direct position
-                    
-                    # Debug output to see what's available in output
-                    output_frames = list(self.predictor.demo_inference_state["output"].keys())
-                    print(f"Available demo frames: {output_frames[:10]}{'...' if len(output_frames) > 10 else ''}")
-                    
-                    obj_id = self.current_object_id.get()
-                    
-                    # Get the mask for this frame
-                    mask = None
-                    try:
-                        mask = self.predictor.get_mask_for_frame(frame_pos, obj_id)
-                        if mask is not None and np.any(mask):
-                            print(f"Found mask for slice {idx}, frame {frame_pos}, shape: {mask.shape}, non-zero: {np.count_nonzero(mask)}")
-                            self.display_mask(mask)
-                            return
-                        else:
-                            print(f"No mask content found for slice {idx}, frame {frame_pos}")
-                            
-                            # Try nearby frames if direct position didn't work
-                            for offset in range(1, 10):
-                                for pos in [frame_pos - offset, frame_pos + offset]:
-                                    if pos in self.predictor.demo_inference_state["output"]:
-                                        try:
-                                            mask = self.predictor.get_mask_for_frame(pos, obj_id)
-                                            if mask is not None and np.any(mask):
-                                                print(f"Found mask at nearby position {pos}")
-                                                self.display_mask(mask)
-                                                return
-                                        except Exception:
-                                            pass
-                    except Exception as e:
-                        print(f"Error getting mask for frame {frame_pos}: {e}")
-                    
-                    # If we still have no mask, check if we're just trying to display the slice without any masks
-                    print("No valid mask found, displaying without mask")
-                    self._update_display_with_points()
-                    return
-                    
-                except Exception as e:
-                    print(f"Could not load demo mask: {e}")
-            
-            elif hasattr(self.predictor, 'inference_state') and self.predictor.inference_state is not None:
-                print(f"Checking for propagated mask")
+                print(f"Checking for mask for current Object {current_obj_id} at frame {frame_pos}")
+                mask_for_current = self.predictor.get_mask_for_frame(frame_pos, current_obj_id)
                 
-                try:
-                    # First try using the slice-to-frame mapping if available
-                    frame_pos = None
-                    
-                    # Check if we have a slice-to-frame mapping
-                    if hasattr(self.predictor, 'slice_to_frame_map'):
-                        if idx in self.predictor.slice_to_frame_map:
-                            frame_pos = self.predictor.slice_to_frame_map[idx]
-                            print(f"Using mapped frame position {frame_pos} for slice {idx}")
-                    
-                    # If no mapping found, try to work out the index based on current slice configuration
-                    if frame_pos is None:
-                        if self.predictor.demo_mode:
-                            # In demo mode, frame_pos is the position in the sequence of frames
-                            # For demo mode, we're now using position indices (0 to N-1) instead of actual inline/crossline numbers
-                            if hasattr(self.predictor, 'demo_slice_indices'):
-                                # For demo mode we need the current position (idx) in the demo_slice_indices
-                                demo_indices = list(self.predictor.demo_slice_indices)
-                                
-                                # Check if current idx is directly in demo_slice_indices
-                                if idx in demo_indices:
-                                    frame_pos = demo_indices.index(idx)
-                                    print(f"Current position {idx} found in demo indices at position {frame_pos}")
-                                # Otherwise we can just use the position directly since demo_slice_indices is now [0..N-1]
-                                elif 0 <= idx < len(demo_indices):
-                                    frame_pos = idx
-                                    print(f"Using position index directly: {frame_pos}")
-                                else:
-                                    # Find closest position
-                                    closest_pos = max(0, min(idx, len(demo_indices)-1))
-                                    frame_pos = closest_pos
-                                    print(f"Using closest position {frame_pos} to {idx}")
-                            else:
-                                # Fallback to using idx directly as the frame position
-                                frame_pos = idx
-                                print(f"No demo indices found, using position directly: {frame_pos}")
-                        else:
-                            # For non-demo mode, still need to find the position in the slice range
-                            if slice_type == "inline":
-                                slices = list(range(len(self.segy_loader.inlines)))
-                            elif slice_type == "crossline":
-                                slices = list(range(len(self.segy_loader.crosslines)))
-                            else:  # timeslice
-                                slices = list(range(len(self.segy_loader.timeslices)))
-                                
-                            # Check if idx is in the valid range
-                            if 0 <= idx < len(slices):
-                                frame_pos = idx
-                                print(f"Using position {frame_pos} for slice {idx}")
-                            else:
-                                print(f"Slice {idx} out of range, skipping mask display")
-                                self._update_display_with_points()
-                                return
-                    
-                    # If we still don't have a valid frame_pos, skip mask display
-                    if frame_pos is None:
-                        print(f"Couldn't determine frame position for slice {idx}, skipping mask display")
-                        self._update_display_with_points()
-                        return
-                    
-                    obj_id = self.current_object_id.get()
-                    print(f"Looking for mask at frame position {frame_pos}, object ID {obj_id}")
-                    
-                    # Get the mask for this frame
-                    mask = None
-                    try:
-                        mask = self.predictor.get_mask_for_frame(frame_pos, obj_id)
-                        if mask is not None and np.any(mask):
-                            print(f"Found mask for slice {idx}, frame {frame_pos}, shape: {mask.shape}, non-zero: {np.count_nonzero(mask)}")
-                            self.display_mask(mask)
-                            return
-                        else:
-                            print(f"No mask content found (mask is None or empty) for slice {idx}, frame {frame_pos}")
-                    except Exception as e:
-                        print(f"Error getting mask for slice {idx}, frame {frame_pos}: {e}")
-                    
-                    # If we reach here, no valid mask was found, just display the slice with points
-                    print("No valid mask found, displaying without mask")
-                    self._update_display_with_points()
-                    return
-                    
-                except Exception as e:
-                    print(f"Could not load propagated mask for slice {idx}: {e}")
-                
-            # Update the display
-            print("No propagation info found, displaying slice with points only")
-            self._update_display_with_points()
+                if mask_for_current is not None and np.any(mask_for_current):
+                     print(f"Found mask for current object {current_obj_id}. Displaying all masks.")
+                     # Call display_mask, passing the mask we just found for the current object.
+                     # display_mask will handle fetching and displaying others.
+                     self.display_mask(mask_for_current) 
+                     return # We are done displaying for this slice load
+
+                else:
+                     print(f"No mask found for current object {current_obj_id}. Checking other objects.")
+                     # Even if the current object has no mask, others might.
+                     # We can still call display_mask with None for the current object mask.
+                     # It will then try to fetch masks for all other known objects.
+                     self.display_mask(None)
+                     return # We are done displaying for this slice load
+
+            except Exception as e:
+                 print(f"Error fetching or displaying masks: {e}")
+                 # Fallback to displaying only points if mask fetching/display fails
+                 print("Falling back to displaying points only.")
+                 self._update_display_with_points()
+                 return
+
+            # This part should theoretically not be reached if the try/except block works correctly
+            # but kept as a final fallback.
+            # print("Displaying slice with points only (fallback).")
+            # self._update_display_with_points()
             
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to load slice: {str(e)}")
+            # Add traceback for debugging
+            import traceback
+            trace = traceback.format_exc()
+            messagebox.showerror("Error", f"Failed to load slice: {str(e)}\n\n{trace}")
     
     def _generate_mask(self):
         """Generate mask from annotation points using SAM2"""
-        if not self.points:
-            messagebox.showinfo("Info", "Please add at least one annotation point first.")
+        points, _ = self._get_current_annotations() # Get points for current object
+        if not points:
+            messagebox.showinfo("Info", "Please add at least one annotation point for the current object first.")
             return
             
-        self.status_text.set("Generating mask...")
+        self.status_text.set(f"Generating mask for Object ID {self.current_object_id.get()}...")
         self.progress_var.set(50)
         
         # Start prediction in a thread
@@ -581,41 +513,59 @@ class SeismicApp(ttk.Frame):
     def _generate_mask_thread(self):
         """Thread function for generating mask"""
         try:
+            # Get points and labels for the current object ID
+            points, point_labels = self._get_current_annotations()
+            obj_id = self.current_object_id.get()
+            
             # Predict masks
             masks, scores, logits = self.predictor.predict_masks_from_points(
-                self.points, self.point_labels, multimask_output=True
+                points, point_labels, multimask_output=True
             )
             
             # Select the mask with highest score
             best_mask_idx = np.argmax(scores)
             best_mask = masks[best_mask_idx]
             
+            # Store the generated mask for this object and slice (in predictor)
+            self.predictor.store_mask_for_object(
+                self.current_slice_type.get(), 
+                self.current_slice_idx.get(), 
+                obj_id, 
+                best_mask
+            )
+            
             # Update UI in main thread
             self.queue.put(("display_mask", best_mask))
-            self.queue.put(("status", f"Mask generated with score: {scores[best_mask_idx]:.4f}"))
+            self.queue.put(("status", f"Mask generated for Object {obj_id} with score: {scores[best_mask_idx]:.4f}"))
             self.queue.put(("progress", 100))
                 
         except Exception as e:
-            self.queue.put(("error", f"Error generating mask: {str(e)}"))
+            self.queue.put(("error", f"Error generating mask for Object {self.current_object_id.get()}: {str(e)}"))
             self.queue.put(("progress", 0))
     
     def _clear_annotations(self):
         """Clear annotation points"""
-        self.points = []
-        self.point_labels = []
+        obj_id = self.current_object_id.get()
+        if obj_id in self.object_annotations:
+            self.object_annotations[obj_id]['points'] = []
+            self.object_annotations[obj_id]['labels'] = []
+            print(f"Cleared annotations for Object ID {obj_id}")
+        else:
+            print(f"No annotations found for Object ID {obj_id} to clear.")
         self._update_display_with_points()
     
     def _propagate_to_all(self):
         """Propagate the mask to all slices using SAM2 video predictor"""
-        if not self.points:
-            messagebox.showinfo("Info", "Please add at least one annotation point and generate a mask first.")
+        points, _ = self._get_current_annotations() # Get points for current object
+        if not points:
+            messagebox.showinfo("Info", "Please add at least one annotation point for the current object and generate a mask first.")
             return
             
         # Ask for confirmation
-        if not messagebox.askyesno("Confirm", "This will propagate the mask to all slices. It may take some time. Continue?"):
+        if not messagebox.askyesno("Confirm", f"This will propagate the mask for Object ID {self.current_object_id.get()} to all slices. It may take some time. Continue?"):
             return
             
-        self.status_text.set("Preparing to propagate masks...")
+        self.status_text.set(f"Preparing to propagate masks for Object ID {self.current_object_id.get()}...")
         self.progress_var.set(10)
         
         # Start propagation in a thread
@@ -625,6 +575,8 @@ class SeismicApp(ttk.Frame):
         """Thread function for mask propagation"""
         try:
             slice_type = self.current_slice_type.get()
+            obj_id = self.current_object_id.get() # Get current object ID
+            points, point_labels = self._get_current_annotations() # Get annotations for this object
             
             # Determine slice range
             if slice_type == "inline":
@@ -646,10 +598,10 @@ class SeismicApp(ttk.Frame):
             current_frame_idx = self.current_slice_idx.get()
             current_frame_pos = current_frame_idx  # We're using position indices directly
             
-            self.queue.put(("status", f"Preparing to propagate masks from {slice_type} {current_frame_idx}..."))
+            self.queue.put(("status", f"Preparing to propagate masks for Object {obj_id} from {slice_type} {current_frame_idx}..."))
             self.queue.put(("progress", 15))
             
-            print(f"Slice type: {slice_type}, Current idx: {current_frame_idx}, Position: {current_frame_pos}")
+            print(f"Slice type: {slice_type}, Current idx: {current_frame_idx}, Position: {current_frame_pos}, Object ID: {obj_id}")
             
             # Force demo mode if video predictor failed to initialize properly
             use_demo_mode = self.predictor.demo_mode
@@ -696,7 +648,7 @@ class SeismicApp(ttk.Frame):
                 try:
                     # In demo mode, we're using position indices
                     self.predictor.demo_mode = True  # Force demo mode
-                    self.predictor.init_video_predictor(demo_slices)
+                    self.predictor.init_video_predictor(demo_slices, obj_id) # Pass obj_id
                 except Exception as e:
                     self.queue.put(("error", f"Error initializing video predictor: {str(e)}"))
                     self.queue.put(("progress", 0))
@@ -737,7 +689,7 @@ class SeismicApp(ttk.Frame):
                 MAX_SLICES = 100
                 
                 try:
-                    self.predictor.init_video_predictor(slices, max_slices=MAX_SLICES)
+                    self.predictor.init_video_predictor(slices, obj_id, max_slices=MAX_SLICES) # Pass obj_id
                 except Exception as e:
                     self.queue.put(("error", f"Error initializing video predictor: {str(e)}"))
                     print("Falling back to demo mode for propagation")
@@ -745,7 +697,7 @@ class SeismicApp(ttk.Frame):
                     # Retry with demo mode
                     try:
                         self.predictor.demo_mode = True
-                        self.predictor.init_video_predictor(slices[:MAX_SLICES])
+                        self.predictor.init_video_predictor(slices[:MAX_SLICES], obj_id) # Pass obj_id
                         use_demo_mode = True
                     except Exception as retry_e:
                         self.queue.put(("error", f"Also failed with demo mode: {str(retry_e)}"))
@@ -764,49 +716,52 @@ class SeismicApp(ttk.Frame):
             
             obj_id = self.current_object_id.get()
             
-            self.queue.put(("status", f"Adding points to frame {current_frame_idx} (position {current_frame_pos})..."))
+            self.queue.put(("status", f"Adding points for Object {obj_id} to frame {current_frame_idx} (position {current_frame_pos})..."))
             self.queue.put(("progress", 30))
             
             try:
+                # Use the retrieved points and labels for this object
                 self.predictor.add_point_to_video(
                     current_frame_pos,  # Use position in frame sequence
                     obj_id,
-                    self.points,
-                    self.point_labels
+                    points, 
+                    point_labels 
                 )
             except Exception as e:
-                self.queue.put(("error", f"Error adding points to video: {str(e)}"))
+                self.queue.put(("error", f"Error adding points to video for Object {obj_id}: {str(e)}"))
                 self.queue.put(("progress", 0))
                 return
             
             # Propagate forward
-            self.queue.put(("status", "Propagating masks forward..."))
+            self.queue.put(("status", f"Propagating masks forward for Object {obj_id}..."))
             self.queue.put(("progress", 50))
             
             try:
                 self.predictor.propagate_masks(
                     start_frame_idx=current_frame_pos,  # Use position in sequence
+                    obj_id=obj_id, # Pass obj_id
                     reverse=False
                 )
             except Exception as e:
-                self.queue.put(("error", f"Error propagating masks forward: {str(e)}"))
+                self.queue.put(("error", f"Error propagating masks forward for Object {obj_id}: {str(e)}"))
                 # Continue with backward propagation even if forward fails
             
             # Propagate backward
-            self.queue.put(("status", "Propagating masks backward..."))
+            self.queue.put(("status", f"Propagating masks backward for Object {obj_id}..."))
             self.queue.put(("progress", 80))
             
             try:
                 self.predictor.propagate_masks(
                     start_frame_idx=current_frame_pos,  # Use position in sequence
+                    obj_id=obj_id, # Pass obj_id
                     reverse=True
                 )
             except Exception as e:
-                self.queue.put(("error", f"Error propagating masks backward: {str(e)}"))
+                self.queue.put(("error", f"Error propagating masks backward for Object {obj_id}: {str(e)}"))
                 # Continue to get mask if possible
             
             # Get the result for current frame
-            self.queue.put(("status", "Getting mask for current frame..."))
+            self.queue.put(("status", f"Getting mask for Object {obj_id} on current frame..."))
             self.queue.put(("progress", 90))
             
             try:
@@ -817,10 +772,10 @@ class SeismicApp(ttk.Frame):
                 
                 # Display the result
                 self.queue.put(("display_mask", mask))
-                self.queue.put(("status", "Propagation complete."))
+                self.queue.put(("status", f"Propagation complete for Object {obj_id}."))
                 self.queue.put(("progress", 100))
             except Exception as e:
-                self.queue.put(("error", f"Error getting mask for current frame: {str(e)}"))
+                self.queue.put(("error", f"Error getting mask for current frame (Object {obj_id}): {str(e)}"))
                 self.queue.put(("progress", 0))
                 
         except Exception as e:
@@ -829,8 +784,12 @@ class SeismicApp(ttk.Frame):
             self.queue.put(("error", f"Error propagating masks: {str(e)}\n\n{trace}"))
             self.queue.put(("progress", 0))
     
-    def display_mask(self, mask):
-        """Display the generated mask as overlay"""
+    def display_mask(self, mask_for_current_obj):
+        """Display the slice with masks for ALL relevant objects overlaid."""
+        if not hasattr(self, 'current_slice') or self.current_slice is None:
+            print("Warning: display_mask called without a current slice.")
+            return
+            
         # Clear the axis
         self.ax.clear()
         
@@ -838,26 +797,92 @@ class SeismicApp(ttk.Frame):
         vmin, vmax = np.percentile(self.current_slice, [5, 95])
         self.ax.imshow(self.current_slice, cmap='gray', vmin=vmin, vmax=vmax, aspect='auto')
         
-        # Create mask overlay with transparency
-        mask_overlay = np.zeros((*mask.shape, 4))
-        mask_overlay[mask > 0] = [1, 0, 0, 0.5]  # Red with alpha
+        # Get current slice info
+        slice_type = self.current_slice_type.get()
+        slice_idx = self.current_slice_idx.get()
+        frame_pos = slice_idx # Assuming frame position matches slice index for simplicity here
+                              # A more robust mapping might be needed if using selected_slice_indices
         
-        # Display mask overlay
-        self.ax.imshow(mask_overlay, aspect='auto')
+        current_obj_id = self.current_object_id.get()
+        colors = plt.get_cmap('tab10').colors
         
-        # Add points
-        fg_points = [p for i, p in enumerate(self.points) if self.point_labels[i] == 1]
-        if fg_points:
-            fg_points = np.array(fg_points)
-            self.ax.scatter(fg_points[:, 0], fg_points[:, 1], color='red', marker='o', s=30)
+        # --- Display masks for ALL objects that might have one ---
+        # Combine known object IDs from annotations and predictor states
+        all_known_obj_ids = set(self.object_annotations.keys())
+        if self.predictor:
+             if not self.predictor.demo_mode:
+                 all_known_obj_ids.update(self.predictor.inference_state.keys())
+             else:
+                 all_known_obj_ids.update(self.predictor.demo_state.keys())
+                 
+        print(f"Displaying masks for potential Object IDs: {list(all_known_obj_ids)}")
+
+        for obj_id in sorted(list(all_known_obj_ids)):
+            mask_to_display = None
+            is_current = (obj_id == current_obj_id)
             
-        bg_points = [p for i, p in enumerate(self.points) if self.point_labels[i] == 0]
-        if bg_points:
-            bg_points = np.array(bg_points)
-            self.ax.scatter(bg_points[:, 0], bg_points[:, 1], color='blue', marker='o', s=30)
-        
+            # If this is the current object, use the mask passed to the function
+            if is_current and mask_for_current_obj is not None:
+                mask_to_display = mask_for_current_obj
+                print(f"Using provided mask for current Object {obj_id}")
+            else:
+                # Otherwise, try to fetch the mask from the predictor
+                try:
+                    # Need the frame position corresponding to the slice index
+                    # This might require the slice_to_frame_map if propagation used a subset
+                    # For simplicity, we assume frame_pos = slice_idx here. Refine if needed.
+                    fetched_mask = self.predictor.get_mask_for_frame(frame_pos, obj_id)
+                    if fetched_mask is not None and np.any(fetched_mask):
+                         mask_to_display = fetched_mask
+                         print(f"Fetched mask for Object {obj_id} on frame {frame_pos}")
+                    # else:
+                    #     print(f"No mask found for Object {obj_id} on frame {frame_pos}")
+
+                except Exception as e:
+                     print(f"Could not fetch mask for Object {obj_id} on frame {frame_pos}: {e}")
+
+            # If we have a mask for this object ID, display it
+            if mask_to_display is not None:
+                 if mask_to_display.shape != self.current_slice.shape:
+                     print(f"Warning: Mask shape {mask_to_display.shape} mismatch for Object {obj_id} on slice {self.current_slice.shape}. Skipping.")
+                     continue # Skip overlay if shapes don't match
+
+                 mask_overlay = np.zeros((*mask_to_display.shape, 4))
+                 obj_color = colors[ (obj_id - 1) % len(colors) ]
+                 alpha = 0.6 if is_current else 0.4 # Current slightly more opaque
+                 
+                 mask_overlay[mask_to_display > 0] = [*obj_color, alpha]
+                 self.ax.imshow(mask_overlay, aspect='auto')
+                 print(f"Overlayed mask for Object {obj_id} with color {obj_color} alpha {alpha}")
+
+
+        # --- Plot points for ALL objects ---
+        for obj_id, annotations in self.object_annotations.items():
+             points = annotations['points']
+             point_labels = annotations['labels']
+             
+             if not points: continue
+                 
+             obj_color = colors[ (obj_id - 1) % len(colors) ]
+             is_current = (obj_id == current_obj_id)
+             marker_size = 40 if is_current else 25
+             alpha = 1.0 if is_current else 0.7
+             
+             fg_points = [p for i, p in enumerate(points) if point_labels[i] == 1]
+             if fg_points:
+                 fg_points = np.array(fg_points)
+                 self.ax.scatter(fg_points[:, 0], fg_points[:, 1], color=obj_color, marker='o', 
+                                 s=marker_size, alpha=alpha, label=f'Obj {obj_id} FG' if is_current else f'_Obj {obj_id} FG')
+                                 
+             bg_points = [p for i, p in enumerate(points) if point_labels[i] == 0]
+             if bg_points:
+                 bg_points = np.array(bg_points)
+                 self.ax.scatter(bg_points[:, 0], bg_points[:, 1], color=obj_color, marker='x', 
+                                 s=marker_size, alpha=alpha, label=f'Obj {obj_id} BG' if is_current else f'_Obj {obj_id} BG')
+
         # Update title
-        self.ax.set_title(f"{self.current_slice_type.get().capitalize()} {self.current_slice_idx.get()} with Mask")
+        self.ax.set_title(f"{slice_type.capitalize()} {slice_idx} (Active Object: {current_obj_id}) with Masks")
+        self.ax.legend() # Show legend
         
         # Redraw canvas
         self.canvas.draw()
@@ -952,13 +977,22 @@ class SeismicApp(ttk.Frame):
         except:
             num_slices = 20  # Default if dialog fails
         
-        # Check if we have masks at all
-        has_masks = False
-        if hasattr(self.predictor, 'inference_state') and self.predictor.inference_state is not None:
-            has_masks = len(self.predictor.inference_state["output"]) > 0
-        elif hasattr(self.predictor, 'demo_inference_state') and self.predictor.demo_inference_state is not None:
-            has_masks = len(self.predictor.demo_inference_state["output"]) > 0
+        # Current object ID
+        obj_id = self.current_object_id.get()
         
+        # Check if we have masks at all for this object ID using the dedicated method
+        has_masks = False
+        if hasattr(self.predictor, 'has_masks_for_object') and callable(self.predictor.has_masks_for_object):
+            has_masks = self.predictor.has_masks_for_object(obj_id) # Check specific object
+        else:
+            # Fallback check if the method somehow doesn't exist (should not happen ideally)
+            print("Warning: predictor.has_masks_for_object not found. Limited mask checking.")
+            if not self.predictor.demo_mode and obj_id in self.predictor.inference_state:
+                 has_masks = bool(self.predictor.inference_state[obj_id].get("output"))
+            elif self.predictor.demo_mode and obj_id in self.predictor.demo_state:
+                 demo_inference_state = self.predictor.demo_state[obj_id].get('inference_state', {})
+                 has_masks = bool(demo_inference_state.get("output"))
+
         # If we have masks but they're not propagated to enough slices, ask to propagate
         if has_masks:
             slice_type = self.current_slice_type.get()
@@ -971,11 +1005,11 @@ class SeismicApp(ttk.Frame):
             else:  # timeslice
                 total_slices = len(self.segy_loader.timeslices)
             
-            # Count how many masks we have
+            # Count how many masks we have for the current object
             mask_count = 0
-            obj_id = self.current_object_id.get()
+            # obj_id is already defined
             
-            # Sample a few slices to see if we have masks
+            # Sample a few slices to see if we have masks for this object
             sample_indices = np.linspace(0, total_slices-1, min(10, total_slices), dtype=int)
             for idx in sample_indices:
                 try:
@@ -989,31 +1023,39 @@ class SeismicApp(ttk.Frame):
             if mask_count < 0.7 * len(sample_indices):
                 if messagebox.askyesno("Propagation Needed", 
                                      "Masks have not been fully propagated to all slices. "
-                                     "Propagate masks before visualization? (Recommended)"):
+                                     "Propagate masks for Object {obj_id} before visualization? (Recommended)"):
                     # Run propagation with a wider range to cover all visualization slices
-                    self._propagate_all_for_visualization(num_slices)
+                    self._propagate_all_for_visualization(num_slices, obj_id) # Pass obj_id
                     # Return early - the 3D visualization will be triggered after propagation completes
                     return
                 
         # Start visualization in a separate thread to avoid blocking the main GUI
-        self.status_text.set("Preparing 3D visualization...")
+        self.status_text.set(f"Preparing 3D visualization for ALL Objects...") # Updated status
         self.progress_var.set(10)
         
-        threading.Thread(target=lambda: self._create_3d_visualization(num_slices), daemon=True).start()
+        # Pass only num_slices, _create_3d_visualization will handle finding all objects
+        threading.Thread(target=lambda: self._create_3d_visualization(num_slices), daemon=True).start() # REMOVED obj_id
     
-    def _propagate_all_for_visualization(self, num_slices=100):
+    def _propagate_all_for_visualization(self, num_slices=100, obj_id=None): # Accept obj_id
         """Propagate masks to all slices needed for visualization"""
+        if obj_id is None:
+            obj_id = self.current_object_id.get()
+            
         # Start propagation in a thread
-        self.status_text.set("Propagating masks for visualization...")
+        self.status_text.set(f"Propagating masks for Object {obj_id} for visualization...")
         self.progress_var.set(5)
         
         # Run with increased slice coverage
-        threading.Thread(target=lambda: self._propagate_thread_for_viz(num_slices), daemon=True).start()
+        threading.Thread(target=lambda: self._propagate_thread_for_viz(num_slices, obj_id), daemon=True).start() # Pass obj_id
     
-    def _propagate_thread_for_viz(self, num_slices=100):
+    def _propagate_thread_for_viz(self, num_slices=100, obj_id=None): # Accept obj_id
         """Thread function for mask propagation with visualization followup"""
         try:
+            if obj_id is None: # Ensure obj_id is set
+                obj_id = self.current_object_id.get()
+                
             slice_type = self.current_slice_type.get()
+            points, point_labels = self._get_current_annotations() # Use annotations for the specific obj_id
             
             # Determine slice range
             if slice_type == "inline":
@@ -1035,10 +1077,10 @@ class SeismicApp(ttk.Frame):
             current_frame_idx = self.current_slice_idx.get()
             current_frame_pos = current_frame_idx  # We're using position indices directly
             
-            self.queue.put(("status", f"Preparing to propagate masks from {slice_type} {current_frame_idx}..."))
+            self.queue.put(("status", f"Preparing to propagate masks for Object {obj_id} from {slice_type} {current_frame_idx}..."))
             self.queue.put(("progress", 15))
             
-            print(f"Slice type: {slice_type}, Current idx: {current_frame_idx}, Position: {current_frame_pos}")
+            print(f"Slice type: {slice_type}, Current idx: {current_frame_idx}, Position: {current_frame_pos}, Object ID: {obj_id}")
             
             # Force demo mode if video predictor failed to initialize properly
             use_demo_mode = self.predictor.demo_mode
@@ -1086,7 +1128,7 @@ class SeismicApp(ttk.Frame):
                 try:
                     # In demo mode, we're using position indices
                     self.predictor.demo_mode = True  # Force demo mode
-                    self.predictor.init_video_predictor(demo_slices)
+                    self.predictor.init_video_predictor(demo_slices, obj_id) # Pass obj_id
                 except Exception as e:
                     self.queue.put(("error", f"Error initializing video predictor: {str(e)}"))
                     self.queue.put(("progress", 0))
@@ -1127,7 +1169,7 @@ class SeismicApp(ttk.Frame):
                 MAX_SLICES = max(200, num_slices * 2)  # Ensure wide coverage for visualization
                 
                 try:
-                    self.predictor.init_video_predictor(slices, max_slices=MAX_SLICES)
+                    self.predictor.init_video_predictor(slices, obj_id, max_slices=MAX_SLICES) # Pass obj_id
                 except Exception as e:
                     self.queue.put(("error", f"Error initializing video predictor: {str(e)}"))
                     print("Falling back to demo mode for propagation")
@@ -1135,7 +1177,7 @@ class SeismicApp(ttk.Frame):
                     # Retry with demo mode
                     try:
                         self.predictor.demo_mode = True
-                        self.predictor.init_video_predictor(slices[:MAX_SLICES])
+                        self.predictor.init_video_predictor(slices[:MAX_SLICES], obj_id) # Pass obj_id
                         use_demo_mode = True
                     except Exception as retry_e:
                         self.queue.put(("error", f"Also failed with demo mode: {str(retry_e)}"))
@@ -1154,49 +1196,52 @@ class SeismicApp(ttk.Frame):
             
             obj_id = self.current_object_id.get()
             
-            self.queue.put(("status", f"Adding points to frame {current_frame_idx} (position {current_frame_pos})..."))
+            self.queue.put(("status", f"Adding points for Object {obj_id} to frame {current_frame_idx} (position {current_frame_pos})..."))
             self.queue.put(("progress", 30))
             
             try:
+                # Use points/labels for this object
                 self.predictor.add_point_to_video(
                     current_frame_pos,  # Use position in frame sequence
                     obj_id,
-                    self.points,
-                    self.point_labels
+                    points, 
+                    point_labels
                 )
             except Exception as e:
-                self.queue.put(("error", f"Error adding points to video: {str(e)}"))
+                self.queue.put(("error", f"Error adding points to video for Object {obj_id}: {str(e)}"))
                 self.queue.put(("progress", 0))
                 return
             
             # Propagate forward
-            self.queue.put(("status", "Propagating masks forward..."))
+            self.queue.put(("status", f"Propagating masks forward for Object {obj_id}..."))
             self.queue.put(("progress", 50))
             
             try:
                 self.predictor.propagate_masks(
                     start_frame_idx=current_frame_pos,  # Use position in sequence
+                    obj_id=obj_id, # Pass obj_id
                     reverse=False
                 )
             except Exception as e:
-                self.queue.put(("error", f"Error propagating masks forward: {str(e)}"))
+                self.queue.put(("error", f"Error propagating masks forward for Object {obj_id}: {str(e)}"))
                 # Continue with backward propagation even if forward fails
             
             # Propagate backward
-            self.queue.put(("status", "Propagating masks backward..."))
+            self.queue.put(("status", f"Propagating masks backward for Object {obj_id}..."))
             self.queue.put(("progress", 80))
             
             try:
                 self.predictor.propagate_masks(
                     start_frame_idx=current_frame_pos,  # Use position in sequence
+                    obj_id=obj_id, # Pass obj_id
                     reverse=True
                 )
             except Exception as e:
-                self.queue.put(("error", f"Error propagating masks backward: {str(e)}"))
+                self.queue.put(("error", f"Error propagating masks backward for Object {obj_id}: {str(e)}"))
                 # Continue to get mask if possible
             
             # Get the result for current frame
-            self.queue.put(("status", "Getting mask for current frame..."))
+            self.queue.put(("status", f"Getting mask for Object {obj_id} on current frame..."))
             self.queue.put(("progress", 90))
             
             try:
@@ -1205,16 +1250,16 @@ class SeismicApp(ttk.Frame):
                     obj_id
                 )
                 
-                # Display the result
+                # Display the result on the 2D canvas
                 self.queue.put(("display_mask", mask))
-                self.queue.put(("status", "Propagation complete. Starting 3D visualization..."))
+                self.queue.put(("status", f"Propagation complete for Object {obj_id}. Starting 3D visualization..."))
                 self.queue.put(("progress", 95))
                 
-                # Now start the 3D visualization
-                threading.Thread(target=lambda: self._create_3d_visualization(num_slices), daemon=True).start()
+                # Now start the 3D visualization (no obj_id needed, it will show all)
+                threading.Thread(target=lambda: self._create_3d_visualization(num_slices), daemon=True).start() # REMOVED obj_id
                 
             except Exception as e:
-                self.queue.put(("error", f"Error getting mask for current frame: {str(e)}"))
+                self.queue.put(("error", f"Error getting mask for current frame (Object {obj_id}): {str(e)}"))
                 self.queue.put(("progress", 0))
                 
         except Exception as e:
@@ -1223,10 +1268,13 @@ class SeismicApp(ttk.Frame):
             self.queue.put(("error", f"Error propagating masks: {str(e)}\n\n{trace}"))
             self.queue.put(("progress", 0))
 
-    def _create_3d_visualization(self, num_slices=20):
-        """Create a very simple 3D visualization of seismic data and masks using PyVista"""
+    def _create_3d_visualization(self, num_slices=20): # REMOVED obj_id parameter
+        """Create a very simple 3D visualization of seismic data and ALL available masks using PyVista"""
         try:
-            self.queue.put(("status", f"Creating ultra-simplified 3D visualization with {num_slices} slices..."))
+            # if obj_id is None: # Ensure obj_id is set - No longer needed
+            #     obj_id = self.current_object_id.get()
+                
+            self.queue.put(("status", f"Creating 3D visualization with {num_slices} slices for ALL objects...")) # Updated status
             self.queue.put(("progress", 30))
             
             # Get the seismic data
@@ -1238,8 +1286,8 @@ class SeismicApp(ttk.Frame):
             # Current slice type
             slice_type = self.current_slice_type.get()
             
-            # Get current object ID for masks
-            obj_id = self.current_object_id.get()
+            # # Get current object ID for masks (already passed as argument) - No longer needed
+            # # obj_id = self.current_object_id.get()
             
             # Create a PyVista plotter
             plotter = pv.Plotter(notebook=False)
@@ -1265,183 +1313,118 @@ class SeismicApp(ttk.Frame):
                 indices = np.linspace(0, nk-1, num_slices, dtype=int)
                 self.queue.put(("status", f"Showing {num_slices} time slices: {indices[:5]}..."))
                 
+            # Get all known object IDs to check for masks
+            all_known_obj_ids = set(self.object_annotations.keys())
+            if self.predictor:
+                if not self.predictor.demo_mode:
+                    all_known_obj_ids.update(self.predictor.inference_state.keys())
+                else:
+                    all_known_obj_ids.update(self.predictor.demo_state.keys())
+            print(f"Checking for masks for Object IDs in 3D view: {list(all_known_obj_ids)}")
+            colors = plt.get_cmap('tab10').colors # Use consistent colors
+
             # Create a simple display for each slice
             for i, idx in enumerate(indices):
                 try:
                     self.queue.put(("status", f"Processing slice {i+1}/{num_slices}: {idx}"))
                     self.queue.put(("progress", 30 + int(60 * i / num_slices)))
                     
+                    # Get slice data only once per slice index
+                    slice_data = None
+                    grid = None # Initialize grid to None
+                    
                     # Process differently based on slice type
                     if slice_type == "inline":
                         # Get slice data with downsampling
                         slice_data = seismic_volume[idx, ::ds_j, ::ds_k]
-                        
-                        # Get dimensions after downsampling
                         s_nj, s_nk = slice_data.shape
-                        
-                        # Create a simple surface at the correct position
-                        # We use PolyData instead of StructuredGrid for simpler memory usage
                         x_coords = np.ones(s_nj * s_nk) * idx
                         y_coords = np.repeat(np.arange(0, s_nj * ds_j, ds_j), s_nk)
-                        z_coords = np.tile(np.arange(0, s_nk * ds_k, ds_k), s_nj) / 8  # Scale Z
-                        
-                        # Create points array
+                        z_coords = np.tile(np.arange(0, s_nk * ds_k, ds_k), s_nj) / 8
                         points = np.column_stack((x_coords, y_coords, z_coords))
-                        
-                        # Create mesh using pyvista points_to_poly_data
                         grid = pv.PolyData(points)
                         
-                        # Set scalar data for colormapping (normalized)
-                        vmin, vmax = np.percentile(slice_data, [5, 95])
-                        norm_data = np.clip(slice_data, vmin, vmax)
-                        norm_data = (norm_data - vmin) / (vmax - vmin)
-                        grid.point_data["intensity"] = norm_data.flatten()
-                        
-                        # Create a delimiter for this slice
-                        delimiter = pv.Plane(center=(idx, s_nj//2, s_nk//2), 
-                                            direction=(1, 0, 0), 
-                                            i_size=1, j_size=s_nj*ds_j)
-                        
-                        # Add mesh to plotter with seismic colormap
-                        plotter.add_mesh(grid, cmap="seismic", point_size=3, render_points_as_spheres=True)
-                        plotter.add_mesh(delimiter, color="grey", opacity=0.1)
-                        
-                        # Try to add mask if available
-                        try:
-                            mask = self.predictor.get_mask_for_frame(idx, obj_id)
-                            if mask is not None and np.any(mask):
-                                # Transpose and downsample
-                                mask_t = mask.T
-                                if mask_t.shape[0] > 1 and mask_t.shape[1] > 1:
-                                    mask_ds = mask_t[::ds_j, ::ds_k]
-                                    if mask_ds.shape == slice_data.shape:
-                                        # Create mask points - only where mask is True
-                                        mask_points = []
-                                        for j in range(s_nj):
-                                            for k in range(s_nk):
-                                                if mask_ds[j, k]:
-                                                    mask_points.append([idx, j*ds_j, k*ds_k/8])
-                                        
-                                        if mask_points:
-                                            # Create mesh for mask points
-                                            mask_poly = pv.PolyData(np.array(mask_points))
-                                            plotter.add_mesh(mask_poly, color="blue", point_size=5, 
-                                                            render_points_as_spheres=True)
-                        except:
-                            pass
-                            
                     elif slice_type == "crossline":
                         # Get slice data with downsampling
                         slice_data = seismic_volume[::ds_i, idx, ::ds_k]
-                        
-                        # Get dimensions after downsampling
                         s_ni, s_nk = slice_data.shape
-                        
-                        # Create a simple point cloud at the correct position
                         x_coords = np.repeat(np.arange(0, s_ni * ds_i, ds_i), s_nk)
                         y_coords = np.ones(s_ni * s_nk) * idx
-                        z_coords = np.tile(np.arange(0, s_nk * ds_k, ds_k), s_ni) / 8  # Scale Z
-                        
-                        # Create points array
+                        z_coords = np.tile(np.arange(0, s_nk * ds_k, ds_k), s_ni) / 8
                         points = np.column_stack((x_coords, y_coords, z_coords))
-                        
-                        # Create mesh using pyvista points
                         grid = pv.PolyData(points)
                         
-                        # Set scalar data for colormapping (normalized)
-                        vmin, vmax = np.percentile(slice_data, [5, 95])
-                        norm_data = np.clip(slice_data, vmin, vmax)
-                        norm_data = (norm_data - vmin) / (vmax - vmin)
-                        grid.point_data["intensity"] = norm_data.flatten()
-                        
-                        # Create a delimiter for this slice
-                        delimiter = pv.Plane(center=(s_ni//2, idx, s_nk//2), 
-                                            direction=(0, 1, 0), 
-                                            i_size=s_ni*ds_i, j_size=1)
-                        
-                        # Add mesh to plotter with seismic colormap
-                        plotter.add_mesh(grid, cmap="seismic", point_size=3, render_points_as_spheres=True)
-                        plotter.add_mesh(delimiter, color="grey", opacity=0.1)
-                        
-                        # Try to add mask if available
-                        try:
-                            mask = self.predictor.get_mask_for_frame(idx, obj_id)
-                            if mask is not None and np.any(mask):
-                                # Transpose and downsample
-                                mask_t = mask.T
-                                if mask_t.shape[0] > 1 and mask_t.shape[1] > 1:
-                                    mask_ds = mask_t[::ds_i, ::ds_k]
-                                    if mask_ds.shape == slice_data.shape:
-                                        # Create mask points - only where mask is True
-                                        mask_points = []
-                                        for i in range(s_ni):
-                                            for k in range(s_nk):
-                                                if mask_ds[i, k]:
-                                                    mask_points.append([i*ds_i, idx, k*ds_k/8])
-                                        
-                                        if mask_points:
-                                            # Create mesh for mask points
-                                            mask_poly = pv.PolyData(np.array(mask_points))
-                                            plotter.add_mesh(mask_poly, color="blue", point_size=5, 
-                                                            render_points_as_spheres=True)
-                        except:
-                            pass
-                    
                     else:  # timeslice
                         # Get slice data with downsampling
                         slice_data = seismic_volume[::ds_i, ::ds_j, idx]
-                        
-                        # Get dimensions after downsampling
                         s_ni, s_nj = slice_data.shape
-                        
-                        # Create a simple point cloud at the correct position
                         x_coords = np.repeat(np.arange(0, s_ni * ds_i, ds_i), s_nj)
                         y_coords = np.tile(np.arange(0, s_nj * ds_j, ds_j), s_ni)
-                        z_coords = np.ones(s_ni * s_nj) * idx / 8  # Scale Z
-                        
-                        # Create points array
+                        z_coords = np.ones(s_ni * s_nj) * idx / 8
                         points = np.column_stack((x_coords, y_coords, z_coords))
-                        
-                        # Create mesh using pyvista points
                         grid = pv.PolyData(points)
-                        
-                        # Set scalar data for colormapping (normalized)
-                        vmin, vmax = np.percentile(slice_data, [5, 95])
-                        norm_data = np.clip(slice_data, vmin, vmax)
-                        norm_data = (norm_data - vmin) / (vmax - vmin)
-                        grid.point_data["intensity"] = norm_data.flatten()
-                        
-                        # Create a delimiter for this slice
-                        delimiter = pv.Plane(center=(s_ni//2, s_nj//2, idx/8), 
-                                            direction=(0, 0, 1), 
-                                            i_size=s_ni*ds_i, j_size=s_nj*ds_j)
-                        
-                        # Add mesh to plotter with seismic colormap
-                        plotter.add_mesh(grid, cmap="seismic", point_size=3, render_points_as_spheres=True)
-                        plotter.add_mesh(delimiter, color="grey", opacity=0.1)
-                        
-                        # Try to add mask if available
+
+                    # Add seismic data to plotter if available
+                    if grid is not None and slice_data is not None:
+                         vmin, vmax = np.percentile(slice_data, [5, 95])
+                         norm_data = np.clip(slice_data, vmin, vmax)
+                         norm_data = (norm_data - vmin) / (vmax - vmin) if (vmax - vmin) > 1e-6 else np.zeros_like(slice_data)
+                         grid.point_data["intensity"] = norm_data.flatten()
+                         
+                         # Add mesh to plotter with seismic colormap
+                         plotter.add_mesh(grid, cmap="seismic", point_size=3, render_points_as_spheres=True, scalars="intensity")
+                         
+                         # Add delimiter plane (optional, can be removed if too cluttered)
+                         # ... (delimiter code can remain or be removed) ...
+
+                    # --- Loop through all known object IDs to add their masks ---
+                    for current_obj_id_to_display in all_known_obj_ids:
                         try:
-                            mask = self.predictor.get_mask_for_frame(idx, obj_id)
+                            mask = self.predictor.get_mask_for_frame(idx, current_obj_id_to_display) 
                             if mask is not None and np.any(mask):
-                                if mask.shape[0] > 1 and mask.shape[1] > 1:
-                                    mask_ds = mask[::ds_i, ::ds_j]
-                                    if mask_ds.shape == slice_data.shape:
-                                        # Create mask points - only where mask is True
-                                        mask_points = []
-                                        for i in range(s_ni):
-                                            for j in range(s_nj):
-                                                if mask_ds[i, j]:
-                                                    mask_points.append([i*ds_i, j*ds_j, idx/8])
-                                        
-                                        if mask_points:
-                                            # Create mesh for mask points
-                                            mask_poly = pv.PolyData(np.array(mask_points))
-                                            plotter.add_mesh(mask_poly, color="blue", point_size=5, 
-                                                            render_points_as_spheres=True)
-                        except:
-                            pass
-                
+                                # Get color for this specific object
+                                obj_color = colors[ (current_obj_id_to_display - 1) % len(colors) ]
+                                
+                                # Process mask based on slice type (handle downsampling and coordinates)
+                                mask_points = []
+                                if slice_type == "inline":
+                                     mask_t = mask.T
+                                     if mask_t.shape[0] > 1 and mask_t.shape[1] > 1:
+                                         mask_ds = mask_t[::ds_j, ::ds_k]
+                                         if mask_ds.shape == slice_data.shape:
+                                             for j in range(s_nj):
+                                                 for k in range(s_nk):
+                                                     if mask_ds[j, k]:
+                                                         mask_points.append([idx, j*ds_j, k*ds_k/8])
+                                elif slice_type == "crossline":
+                                     mask_t = mask.T
+                                     if mask_t.shape[0] > 1 and mask_t.shape[1] > 1:
+                                         mask_ds = mask_t[::ds_i, ::ds_k]
+                                         if mask_ds.shape == slice_data.shape:
+                                             for i_ in range(s_ni): # Use different index variable
+                                                 for k in range(s_nk):
+                                                     if mask_ds[i_, k]:
+                                                         mask_points.append([i_*ds_i, idx, k*ds_k/8])
+                                else: # timeslice
+                                     if mask.shape[0] > 1 and mask.shape[1] > 1:
+                                         mask_ds = mask[::ds_i, ::ds_j]
+                                         if mask_ds.shape == slice_data.shape:
+                                             for i_ in range(s_ni): # Use different index variable
+                                                 for j in range(s_nj):
+                                                     if mask_ds[i_, j]:
+                                                         mask_points.append([i_*ds_i, j*ds_j, idx/8])
+
+                                # If points were found for this mask, add them
+                                if mask_points:
+                                    mask_poly = pv.PolyData(np.array(mask_points))
+                                    plotter.add_mesh(mask_poly, color=obj_color, point_size=5, 
+                                                    render_points_as_spheres=True, 
+                                                    label=f"Object {current_obj_id_to_display}") # Add label
+
+                        except Exception as mask_err:
+                            print(f"Error processing mask for Object {current_obj_id_to_display} on slice {idx}: {mask_err}")
+                            pass # Continue to next object or slice
+                            
                 except Exception as slice_err:
                     self.queue.put(("status", f"Error processing slice {idx}: {slice_err}"))
                     # Continue with next slice
@@ -1450,6 +1433,7 @@ class SeismicApp(ttk.Frame):
             try:
                 plotter.add_axes()
                 plotter.show_grid()
+                plotter.add_legend() # Add legend to identify mask colors
             except:
                 pass
             
@@ -1460,8 +1444,8 @@ class SeismicApp(ttk.Frame):
             # Try to show the window with fallbacks
             try:
                 # First try interactive viewing
-                plotter.show(title=f"Seismic {slice_type} Slices with Masks")
-                self.queue.put(("status", "3D visualization complete."))
+                plotter.show(title=f"Seismic {slice_type} Slices with All Masks") # Update title
+                self.queue.put(("status", f"3D visualization complete.")) # Updated status
                 self.queue.put(("progress", 100))
                 
             except Exception as e1:
@@ -1538,7 +1522,7 @@ class SeismicApp(ttk.Frame):
             
         if not has_masks:
             if not messagebox.askyesno("No Masks Detected", 
-                                     "No masks have been generated. You need to create and propagate masks before generating surfaces. Do you want to generate a surface anyway?"):
+                                     "No masks have been generated. You need to create and propagate masks before generating surfaces. Do you want to generate a surface anyway (might be empty)?"):
                 return
         
         # Ask the user for the surface generation method
@@ -1578,25 +1562,28 @@ class SeismicApp(ttk.Frame):
             smoothing = 10
         
         # Start the surface generation in a separate thread
-        self.status_text.set("Preparing surface generation...")
+        self.status_text.set(f"Preparing surface generation for Object {self.current_object_id.get()}...")
         self.progress_var.set(10)
         
-        threading.Thread(target=lambda: self._generate_3d_surface(num_slices, smoothing, use_triangulation, max_points), 
+        threading.Thread(target=lambda: self._generate_3d_surface(num_slices, smoothing, use_triangulation, max_points, self.current_object_id.get()), # Pass obj_id
                         daemon=True).start()
 
-    def _generate_3d_surface(self, num_slices=20, smoothing=10, use_triangulation=False, max_points=1000):
+    def _generate_3d_surface(self, num_slices=20, smoothing=10, use_triangulation=False, max_points=1000, obj_id=None): # Accept obj_id
         """Generate a 3D surface from mask points using LoopStructural or triangulation"""
         try:
-            self.queue.put(("status", f"Generating 3D surface from {num_slices} slices..."))
+            if obj_id is None: # Ensure obj_id is set
+                obj_id = self.current_object_id.get()
+                
+            self.queue.put(("status", f"Generating 3D surface for Object {obj_id} from {num_slices} slices..."))
             self.queue.put(("progress", 20))
             
             # Get the seismic data dimensions
             seismic_volume = self.segy_loader.data
             ni, nj, nk = seismic_volume.shape
             
-            # Current slice type and object ID
+            # Current slice type and object ID (already passed as argument)
             slice_type = self.current_slice_type.get()
-            obj_id = self.current_object_id.get()
+            # obj_id = self.current_object_id.get()
             
             # Determine slices to sample based on slice type
             if slice_type == "inline":
@@ -1609,20 +1596,20 @@ class SeismicApp(ttk.Frame):
                 indices = np.linspace(0, nk-1, num_slices, dtype=int)
                 self.queue.put(("status", f"Sampling {num_slices} time slices..."))
             
-            # Check if we need to propagate masks first
-            self._ensure_masks_propagated(indices, obj_id)
+            # Check if we need to propagate masks first for this object
+            self._ensure_masks_propagated(indices, obj_id) # Pass obj_id
             
-            # Collect all mask points for surface generation
+            # Collect all mask points for surface generation for this object
             all_points = []
             
-            # Process slices to collect points where masks exist
+            # Process slices to collect points where masks exist for this object
             for i, idx in enumerate(indices):
-                self.queue.put(("status", f"Processing slice {i+1}/{num_slices}: {idx}"))
+                self.queue.put(("status", f"Processing slice {i+1}/{num_slices}: {idx} for Object {obj_id}"))
                 self.queue.put(("progress", 20 + int(30 * i / num_slices)))
                 
                 try:
-                    # Get mask for this slice
-                    mask = self.predictor.get_mask_for_frame(idx, obj_id)
+                    # Get mask for this slice and object
+                    mask = self.predictor.get_mask_for_frame(idx, obj_id) # Use obj_id
                     
                     if mask is not None and np.any(mask):
                         # Process points based on slice type
@@ -1647,14 +1634,14 @@ class SeismicApp(ttk.Frame):
                                 all_points.append([x, y, idx/8])  # Scale z as in visualization
                 
                 except Exception as e:
-                    print(f"Error processing mask for frame {idx}: {e}")
+                    print(f"Error processing mask for frame {idx}, Object {obj_id}: {e}")
             
             # Check if we have enough points for surface generation
             if len(all_points) < 10:
-                self.queue.put(("error", "Not enough mask points found. Please generate more masks or try a different object ID."))
+                self.queue.put(("error", f"Not enough mask points found for Object {obj_id}. Please generate more masks or try a different object ID."))
                 return
                 
-            self.queue.put(("status", f"Collected {len(all_points)} points for surface generation"))
+            self.queue.put(("status", f"Collected {len(all_points)} points for Object {obj_id} surface generation"))
             self.queue.put(("progress", 50))
             
             # Convert points to numpy array
@@ -1668,9 +1655,13 @@ class SeismicApp(ttk.Frame):
             self.queue.put(("status", "Adding seismic slices for context..."))
             self._add_seismic_slices_to_plot(plotter, slice_type, seismic_volume, indices)
             
+            # Use object color for point cloud and surface
+            colors = plt.get_cmap('tab10').colors
+            obj_color = colors[ (obj_id - 1) % len(colors) ]
+            
             # Add scatter plot of the points
             point_cloud = pv.PolyData(points_array)
-            plotter.add_mesh(point_cloud, color="blue", point_size=5, render_points_as_spheres=True)
+            plotter.add_mesh(point_cloud, color=obj_color, point_size=5, render_points_as_spheres=True) # Use object color
             
             # Thin the points if needed to improve performance and reduce complexity
             if len(points_array) > max_points:
@@ -1683,17 +1674,17 @@ class SeismicApp(ttk.Frame):
             if use_triangulation:
                 self.queue.put(("status", "Creating surface using triangulation..."))
                 self.queue.put(("progress", 70))
-                self._create_triangulation_surface(subset_points, plotter)
+                self._create_triangulation_surface(subset_points, plotter, obj_color) # Pass color
             else:
                 self.queue.put(("status", "Creating surface using LoopStructural..."))
                 self.queue.put(("progress", 60))
                 # This might fail if LoopStructural isn't available
                 try:
-                    self._create_loopstructural_surface(subset_points, plotter, smoothing, ni, nj, nk)
+                    self._create_loopstructural_surface(subset_points, plotter, smoothing, ni, nj, nk, obj_color) # Pass color
                 except ImportError:
                     # Fall back to triangulation
                     self.queue.put(("status", "LoopStructural failed, falling back to triangulation..."))
-                    self._create_triangulation_surface(subset_points, plotter)
+                    self._create_triangulation_surface(subset_points, plotter, obj_color) # Pass color
                     
             # Add axes and show plot
             plotter.add_axes()
@@ -1704,8 +1695,8 @@ class SeismicApp(ttk.Frame):
             self.queue.put(("progress", 95))
             
             try:
-                plotter.show(title="3D Surface from Masks")
-                self.queue.put(("status", "3D surface visualization complete"))
+                plotter.show(title=f"3D Surface from Masks (Object {obj_id})") # Update title
+                self.queue.put(("status", f"3D surface visualization complete for Object {obj_id}"))
                 self.queue.put(("progress", 100))
             except Exception as e:
                 self.queue.put(("error", f"Error displaying 3D surface: {str(e)}"))
@@ -1717,7 +1708,7 @@ class SeismicApp(ttk.Frame):
             self.queue.put(("error", f"Error in surface generation: {str(e)}\n\n{trace}"))
             self.queue.put(("progress", 0))
         
-    def _create_triangulation_surface(self, points, plotter):
+    def _create_triangulation_surface(self, points, plotter, color="red"): # Accept color
         """Create a surface using simple triangulation"""
         try:
             # Import scipy for Delaunay triangulation
@@ -1763,7 +1754,7 @@ class SeismicApp(ttk.Frame):
                     if len(points) > 50:
                         mesh = mesh.smooth(n_iter=100, relaxation_factor=0.1)
                         
-                    plotter.add_mesh(mesh, color="red", opacity=0.5)
+                    plotter.add_mesh(mesh, color=color, opacity=0.5)
                     self.queue.put(("status", "Created triangulated surface (planar)"))
                     
                 except Exception as e:
@@ -1812,7 +1803,7 @@ class SeismicApp(ttk.Frame):
                             except:
                                 pass  # Smoothing failed, use unsmoothed surface
                         
-                        plotter.add_mesh(surf, color="red", opacity=0.5)
+                        plotter.add_mesh(surf, color=color, opacity=0.5)
                         self.queue.put(("status", "Created triangulated surface"))
                     else:
                         raise ValueError("Surface generation failed with all methods")
@@ -1823,7 +1814,7 @@ class SeismicApp(ttk.Frame):
                     try:
                         cloud = pv.PolyData(points)
                         hull = cloud.delaunay_3d().extract_surface()
-                        plotter.add_mesh(hull, color="red", opacity=0.5)
+                        plotter.add_mesh(hull, color=color, opacity=0.5)
                         self.queue.put(("status", "Created convex hull surface (fallback)"))
                     except:
                         self.queue.put(("status", "Unable to create surface, showing point cloud only"))
@@ -1832,7 +1823,7 @@ class SeismicApp(ttk.Frame):
             self.queue.put(("error", f"Triangulation failed: {str(e)}"))
             self.queue.put(("status", "Unable to create surface, showing point cloud only"))
 
-    def _create_loopstructural_surface(self, points, plotter, smoothing, ni, nj, nk):
+    def _create_loopstructural_surface(self, points, plotter, smoothing, ni, nj, nk, color="red"): # Accept color
         """Create a surface using LoopStructural"""
         try:
             # Try to directly import LoopStructural
@@ -1907,7 +1898,7 @@ class SeismicApp(ttk.Frame):
             
             # If surface creation was successful, add to plot
             if surf.n_points > 0:
-                plotter.add_mesh(surf, color="red", opacity=0.5)
+                plotter.add_mesh(surf, color=color, opacity=0.5)
                 self.queue.put(("status", "Surface created successfully"))
             else:
                 raise ValueError("Failed to create surface - try adjusting smoothness")
@@ -2006,25 +1997,25 @@ class SeismicApp(ttk.Frame):
             print(f"Error adding seismic slices to visualization: {e}")
             # Continue without seismic slices if there's an error
 
-    def _ensure_masks_propagated(self, indices, obj_id):
+    def _ensure_masks_propagated(self, indices, obj_id): # Accept obj_id
         """Ensure masks are propagated for the given slices before visualization"""
         # Calculate how many slices to check
         check_count = min(len(indices), 5)
         check_indices = indices[::len(indices)//check_count] if check_count > 1 else [indices[0]]
         
-        # Count how many have masks
+        # Count how many have masks for this object
         mask_count = 0
         for idx in check_indices:
             try:
-                mask = self.predictor.get_mask_for_frame(idx, obj_id)
+                mask = self.predictor.get_mask_for_frame(idx, obj_id) # Use obj_id
                 if mask is not None and np.any(mask):
                     mask_count += 1
             except:
                 pass
         
-        # If less than 70% have masks, propagate
+        # If less than 70% have masks, propagate for this object
         if mask_count < 0.7 * len(check_indices):
-            self.queue.put(("status", "Some masks missing. Propagating masks..."))
+            self.queue.put(("status", f"Some masks missing for Object {obj_id}. Propagating..."))
             
             # Current slice type
             slice_type = self.current_slice_type.get()
@@ -2032,8 +2023,14 @@ class SeismicApp(ttk.Frame):
             # Get the current position
             current_frame_idx = self.current_slice_idx.get()
             
-            # Store the current position for the demo predictor
-            self.predictor.demo_frame_idx = current_frame_idx
+            # Get annotations for the specific object ID
+            points, labels = [], []
+            if obj_id in self.object_annotations:
+                 points = self.object_annotations[obj_id]['points']
+                 labels = self.object_annotations[obj_id]['labels']
+            
+            # Store the current position for the demo predictor (per object)
+            self.predictor.set_demo_context(current_frame_idx, obj_id, points, labels)
             
             # Force demo mode for more reliable propagation
             use_demo_mode = True
@@ -2043,24 +2040,25 @@ class SeismicApp(ttk.Frame):
             try:
                 if use_demo_mode:
                     self.predictor.demo_mode = True
-                    self.predictor.init_video_predictor(slice_indices)
+                    self.predictor.init_video_predictor(slice_indices, obj_id) # Pass obj_id
                 else:
-                    self.predictor.init_video_predictor(slice_indices)
+                    self.predictor.init_video_predictor(slice_indices, obj_id) # Pass obj_id
             except Exception as e:
                 print(f"Error initializing video predictor: {e}")
                 return
             
-            # Add points to current frame
-            if hasattr(self, 'points') and len(self.points) > 0:
+            # Add points to current frame if they exist for this object
+            if points and len(points) > 0:
                 try:
-                    # Get labels
-                    labels = [1 if label == 'foreground' else 0 for label in self.point_labels]
+                    # Labels are already 0 or 1
+                    # labels = [1 if label == 'foreground' else 0 for label in self.point_labels]
                     
                     # Add points to frame
                     if use_demo_mode:
-                        self.predictor.demo_points = self.points
+                        self.predictor.demo_obj_id = obj_id # Ensure demo obj_id is set
+                        self.predictor.demo_points = points
                         self.predictor.demo_labels = labels
-                        self.predictor.demo_obj_id = obj_id
+                        # demo_frame_idx is set via set_demo_context
                     else:
                         # Find frame index in sequence
                         if current_frame_idx in slice_indices:
@@ -2068,18 +2066,31 @@ class SeismicApp(ttk.Frame):
                         else:
                             frame_pos = 0  # Default to first frame
                         
-                        self.predictor.add_point_to_video(frame_pos, obj_id, self.points, labels)
+                        self.predictor.add_point_to_video(frame_pos, obj_id, points, labels) # Use correct points/labels
                 except Exception as e:
                     print(f"Error adding points to video: {e}")
                     return
             
-            # Propagate masks
+            # Propagate masks for this object
             try:
-                self.predictor.propagate_masks()
-                self.queue.put(("status", "Masks propagated successfully"))
+                self.predictor.propagate_masks(obj_id=obj_id) # Pass obj_id
+                self.queue.put(("status", f"Masks propagated successfully for Object {obj_id}"))
             except Exception as e:
-                print(f"Error propagating masks: {e}")
+                print(f"Error propagating masks for Object {obj_id}: {e}")
                 return
+
+    def _get_current_annotations(self):
+        """Retrieve points and labels for the current object ID."""
+        obj_id = self.current_object_id.get()
+        if obj_id not in self.object_annotations:
+            self.object_annotations[obj_id] = {'points': [], 'labels': []}
+        return self.object_annotations[obj_id]['points'], self.object_annotations[obj_id]['labels']
+
+    def _on_object_id_change(self, event=None):
+        """Handle change in object ID."""
+        print(f"Object ID changed to: {self.current_object_id.get()}")
+        # Reload the current slice view to show annotations for the new object ID
+        self._load_current_slice()
 
 
 def main():

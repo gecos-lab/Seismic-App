@@ -50,9 +50,10 @@ class SeismicPredictor:
         self.current_slice_idx = None
         self.current_slice = None
         
-        # Prediction results
-        self.masks = {}  # Dictionary to store masks for each slice
-        self.inference_state = None  # For video predictor
+        # Prediction results per object ID
+        self.object_masks = {}  # Stores masks per object ID: {obj_id: {slice_key: mask}}
+        self.inference_state = {} # Stores video inference state per object ID: {obj_id: state}
+        self.demo_state = {} # Stores demo mode state per object ID: {obj_id: state_info}
         
     def load_model(self):
         """Load the SAM2 model"""
@@ -152,6 +153,34 @@ class SeismicPredictor:
             print("Falling back to demo mode")
             return False
     
+    def store_mask_for_object(self, slice_type, slice_idx, obj_id, mask):
+        """Store a generated mask for a specific object and slice."""
+        if obj_id not in self.object_masks:
+            self.object_masks[obj_id] = {}
+        slice_key = f"{slice_type}_{slice_idx}"
+        self.object_masks[obj_id][slice_key] = mask
+        print(f"Stored mask for Object {obj_id} on slice {slice_key}")
+
+    def has_masks_for_object(self, obj_id):
+        """Check if any masks (generated or propagated) exist for the given object ID."""
+        # Check generated masks
+        if obj_id in self.object_masks and self.object_masks[obj_id]:
+             return True
+             
+        # Check propagated masks (real predictor)
+        if obj_id in self.inference_state and self.inference_state[obj_id] and \
+           "output" in self.inference_state[obj_id] and self.inference_state[obj_id]["output"]:
+            return True
+            
+        # Check propagated masks (demo mode)
+        if obj_id in self.demo_state and self.demo_state[obj_id] and \
+           "inference_state" in self.demo_state[obj_id] and \
+           "output" in self.demo_state[obj_id]["inference_state"] and \
+           self.demo_state[obj_id]["inference_state"]["output"]:
+            return True
+            
+        return False
+
     def _setup_mock_video_predictor(self):
         """Set up a mock video predictor for compatibility when the real one fails"""
         class MockVideoPredictor:
@@ -181,7 +210,7 @@ class SeismicPredictor:
         """Set the seismic volume data"""
         self.seismic_volume = seismic_volume
         # Reset masks
-        self.masks = {}
+        self.object_masks = {}
         
     def _normalize_slice(self, slice_data):
         """Normalize the slice data to 0-255 range for SAM2 input"""
@@ -237,9 +266,9 @@ class SeismicPredictor:
             multimask_output=multimask_output
         )
         
-        # Store masks for current slice
-        slice_key = f"{self.current_slice_type}_{self.current_slice_idx}"
-        self.masks[slice_key] = masks
+        # Store masks for current slice - REMOVED, handled by store_mask_for_object in App
+        # slice_key = f"{self.current_slice_type}_{self.current_slice_idx}"
+        # self.masks[slice_key] = masks 
         
         return masks, scores, logits
     
@@ -350,23 +379,39 @@ class SeismicPredictor:
         scores = np.array(scores)
         logits = np.zeros((3, h, w))  # Fake logits
         
-        # Store masks for current slice
-        slice_key = f"{self.current_slice_type}_{self.current_slice_idx}"
-        self.masks[slice_key] = masks
+        # Store masks for current slice - REMOVED, handled by store_mask_for_object in App
+        # slice_key = f"{self.current_slice_type}_{self.current_slice_idx}"
+        # self.masks[slice_key] = masks 
         
         return masks, scores, logits
     
-    def init_video_predictor(self, slice_indices, max_slices=None):
-        """Initialize the video predictor with a sequence of slices
+    def set_demo_context(self, frame_idx, obj_id, points, labels):
+        """Set context for demo mode operations for a specific object."""
+        if obj_id not in self.demo_state:
+            self.demo_state[obj_id] = {}
+        self.demo_state[obj_id]['frame_idx'] = frame_idx
+        self.demo_state[obj_id]['points'] = points
+        self.demo_state[obj_id]['labels'] = labels
+        print(f"Set demo context for Object {obj_id}: frame={frame_idx}, {len(points)} points")
+
+    def init_video_predictor(self, slice_indices, obj_id, max_slices=None): # Accept obj_id
+        """Initialize the video predictor with a sequence of slices for a specific object
         
         Args:
             slice_indices: List of slice indices to use for propagation
+            obj_id: The object ID this initialization is for
             max_slices: Maximum number of slices to use (to limit memory usage)
         """
         if self.demo_mode:
-            # In demo mode, just store the indices for later use
-            self.demo_slice_indices = slice_indices
-            print(f"Demo mode: Initialized video predictor with {len(slice_indices)} frames")
+            # In demo mode, store indices and other context per object ID
+            if obj_id not in self.demo_state:
+                 self.demo_state[obj_id] = {}
+            self.demo_state[obj_id]['slice_indices'] = slice_indices
+            # Ensure inference_state exists for demo
+            if 'inference_state' not in self.demo_state[obj_id]:
+                self.demo_state[obj_id]['inference_state'] = {"output": {}, "object_ids": [obj_id]}
+                
+            print(f"Demo mode: Initialized video predictor for Object {obj_id} with {len(slice_indices)} frames")
             return True
             
         # Limit the number of slices if needed
@@ -441,13 +486,13 @@ class SeismicPredictor:
             
         # Initialize video predictor
         print(f"Initializing video predictor with {len(frames)} frames...")
-        self.inference_state = self.video_predictor.init_state(frames, 
+        self.inference_state[obj_id] = self.video_predictor.init_state(frames, 
                                                               offload_video_to_cpu=True)
         
         # Store a mapping from selected slice indices to frame indices
-        self.slice_to_frame_map = {idx: i for i, idx in enumerate(self.selected_slice_indices)}
+        self.slice_maps[obj_id] = {idx: i for i, idx in enumerate(self.selected_slice_indices)}
         
-        print(f"Video predictor initialization complete")
+        print(f"Video predictor initialization complete for Object {obj_id}")
         return True
         
     def _pad_slice(self, slice_data, target_shape):
@@ -476,18 +521,28 @@ class SeismicPredictor:
             True if successful
         """
         if self.demo_mode:
-            # In demo mode, just store the points and labels
-            self.demo_frame_idx = frame_idx
-            self.demo_obj_id = obj_id
-            self.demo_points = points
-            self.demo_labels = labels
+            # In demo mode, just store the points and labels per object
+            if obj_id not in self.demo_state:
+                self.demo_state[obj_id] = {} # Should be initialized by init_video_predictor
+            self.demo_state[obj_id]['frame_idx'] = frame_idx # Store starting frame
+            self.demo_state[obj_id]['points'] = points
+            self.demo_state[obj_id]['labels'] = labels
+            print(f"Demo mode: Added points for Object {obj_id} at frame {frame_idx}")
             return True
             
-        if self.inference_state is None:
-            raise ValueError("Video predictor not initialized")
+        if obj_id not in self.inference_state:
+            raise ValueError(f"Video predictor not initialized for Object ID {obj_id}")
             
+        current_state = self.inference_state[obj_id]
+        
+        # Add the object ID to the state if it's not there (important for mock predictor)
+        if "object_ids" not in current_state:
+            current_state["object_ids"] = []
+        if obj_id not in current_state["object_ids"]:
+             current_state["object_ids"].append(obj_id)
+             
         self.video_predictor.add_new_points(
-            self.inference_state,
+            current_state,
             frame_idx,
             obj_id,
             points=np.array(points),
@@ -497,10 +552,11 @@ class SeismicPredictor:
         
         return True
         
-    def propagate_masks(self, start_frame_idx=None, max_frames=None, reverse=False):
-        """Propagate masks through the video sequence
+    def propagate_masks(self, obj_id, start_frame_idx=None, max_frames=None, reverse=False): # Add obj_id
+        """Propagate masks through the video sequence for a specific object
         
         Args:
+            obj_id: The object ID to propagate masks for
             start_frame_idx: Starting frame index
             max_frames: Maximum number of frames to process
             reverse: Whether to propagate backward
@@ -509,15 +565,17 @@ class SeismicPredictor:
             True if successful
         """
         if self.demo_mode:
-            # In demo mode, create fake propagated masks for each slice
-            self._generate_demo_propagated_masks(reverse)
+            # In demo mode, create fake propagated masks for the specified object
+            self._generate_demo_propagated_masks(obj_id, reverse) # Pass obj_id
             return True
             
-        if self.inference_state is None:
-            raise ValueError("Video predictor not initialized")
+        if obj_id not in self.inference_state:
+            raise ValueError(f"Video predictor not initialized for Object ID {obj_id}")
+            
+        current_state = self.inference_state[obj_id]
             
         self.video_predictor.propagate_in_video(
-            self.inference_state,
+            current_state, # Use state for this object
             start_frame_idx=start_frame_idx,
             max_frame_num_to_track=max_frames,
             reverse=reverse
@@ -525,48 +583,65 @@ class SeismicPredictor:
         
         return True
     
-    def _generate_demo_propagated_masks(self, reverse=False):
-        """Generate fake propagated masks for demo mode"""
-        if not hasattr(self, 'demo_slice_indices') or not hasattr(self, 'demo_points'):
-            raise ValueError("Demo video predictor not initialized or points not added")
+    def _generate_demo_propagated_masks(self, obj_id, reverse=False): # Accept obj_id
+        """Generate fake propagated masks for demo mode for a specific object"""
+        if obj_id not in self.demo_state or 'slice_indices' not in self.demo_state[obj_id] or \
+           'points' not in self.demo_state[obj_id] or 'frame_idx' not in self.demo_state[obj_id]:
+            raise ValueError(f"Demo video predictor context not fully set for Object ID {obj_id}")
             
-        # Get slice dimensions from current slice
-        base_h, base_w = self.current_slice.shape
+        state_info = self.demo_state[obj_id]
+        slice_indices = state_info['slice_indices']
+        points = state_info['points']
+        labels = state_info['labels']
+        start_frame = state_info['frame_idx'] # This is the frame position
         
-        # Create a dictionary to simulate inference state
-        if not hasattr(self, 'demo_inference_state'):
-            self.demo_inference_state = {
-                "output": {},
-                "object_ids": [self.demo_obj_id]
-            }
-            
-        # Note: demo_slice_indices are now position indices (0 to len-1), not actual slice indices
-        slice_positions = list(range(len(self.demo_slice_indices)))
+        # Get slice dimensions from current slice
+        if self.current_slice is None:
+            # Attempt to load the slice corresponding to the start frame
+            try:
+                 slice_idx = slice_indices[start_frame]
+                 if self.current_slice_type == "inline":
+                     slice_data = self.seismic_volume.get_inline_slice(slice_idx)
+                 elif self.current_slice_type == "crossline":
+                     slice_data = self.seismic_volume.get_crossline_slice(slice_idx)
+                 else: # timeslice
+                     slice_data = self.seismic_volume.get_timeslice(slice_idx)
+                 base_h, base_w = slice_data.shape
+            except:
+                 print("Warning: Cannot determine slice shape for demo mask generation. Using default 500x500.")
+                 base_h, base_w = 500, 500 # Default if no slice loaded
+        else:
+            base_h, base_w = self.current_slice.shape
+        
+        # Use the inference_state stored within demo_state for this object
+        demo_inference_state = state_info.setdefault('inference_state', {"output": {}, "object_ids": [obj_id]})
+        
+        # Note: slice_indices are position indices (0 to len-1)
+        slice_positions = list(range(len(slice_indices)))
         
         # Generate masks for all slices
         direction = -1 if reverse else 1
         
-        # Make sure demo_frame_idx is an integer (frame position)
-        if not isinstance(self.demo_frame_idx, int):
-            print(f"Warning: demo_frame_idx is not an integer: {self.demo_frame_idx}, using 0 instead")
-            self.demo_frame_idx = 0
+        # Make sure start_frame is an integer (frame position)
+        if not isinstance(start_frame, int):
+            print(f"Warning: demo_frame_idx ({start_frame}) is not an integer for Object {obj_id}, using 0 instead")
+            start_frame = 0
+            state_info['frame_idx'] = 0 # Correct stored value
             
         # Define frame ranges for propagation
         if reverse:
-            frame_range = range(self.demo_frame_idx, -1, -1)
+            frame_range = range(start_frame, -1, -1)
         else:
-            frame_range = range(self.demo_frame_idx, len(slice_positions))
+            frame_range = range(start_frame, len(slice_positions))
 
         # First, generate the initial mask at the start frame
-        start_frame = self.demo_frame_idx
-        
-        print(f"Generating demo masks from frame position {start_frame}")
+        print(f"Generating demo masks for Object {obj_id} from frame position {start_frame}")
         
         # Create the initial mask
         try:
             # Get slice data based on the position index
-            position = self.demo_slice_indices[start_frame]
-            print(f"Initial mask: Using position {position}")
+            position = slice_indices[start_frame]
+            print(f"Initial mask for Object {obj_id}: Using position {position}")
             
             if self.current_slice_type == "inline":
                 slice_data = self.seismic_volume.get_inline_slice(position)
@@ -576,31 +651,39 @@ class SeismicPredictor:
                 slice_data = self.seismic_volume.get_timeslice(position)
             
             mask_h, mask_w = slice_data.shape
-            print(f"Initial slice shape: {mask_h}x{mask_w}")
+            print(f"Initial slice shape for Object {obj_id}: {mask_h}x{mask_w}")
         except Exception as e:
-            print(f"Error loading slice for initial mask: {e}, using current slice dimensions")
+            print(f"Error loading slice for initial mask (Object {obj_id}): {e}, using base dimensions")
             mask_h, mask_w = base_h, base_w
         
-        # For the initial frame, use the mask generated from points
-        masks, _, _ = self._generate_demo_mask(self.demo_points, self.demo_labels)
-        initial_mask = masks[0].astype(bool)  # Use the first mask
-        print(f"Generated initial mask with shape {initial_mask.shape}")
+        # For the initial frame, use the mask generated from points for this object
+        # Temporarily set current slice for _generate_demo_mask
+        original_slice = self.current_slice
+        try:
+            if 'slice_data' in locals():
+                 self.current_slice = slice_data
+            else: # Fallback if slice loading failed
+                 self.current_slice = np.zeros((base_h, base_w))
+                 
+            masks, _, _ = self._generate_demo_mask(points, labels)
+            initial_mask = masks[0].astype(bool)  # Use the first mask
+            print(f"Generated initial mask for Object {obj_id} with shape {initial_mask.shape}")
+        finally:
+            self.current_slice = original_slice # Restore original slice
         
-        # Store the initial mask - use position as key
-        self.demo_inference_state["output"][start_frame] = {"mask": [initial_mask]}
+        # Store the initial mask - use frame position as key
+        demo_inference_state["output"][start_frame] = {"mask": [initial_mask]}
         
-        # Get the reference mask structure and size - this is very important!
+        # Get the reference mask structure and size for this object
         reference_mask = initial_mask.copy()
         reference_area = np.count_nonzero(reference_mask)
-        print(f"Reference mask area: {reference_area} pixels")
-        
-        # Store the reference area as a permanent attribute
-        self.reference_mask_area = reference_area
+        state_info['reference_mask_area'] = reference_area # Store per object
+        print(f"Reference mask area for Object {obj_id}: {reference_area} pixels")
         
         # Calculate max allowable mask size (to prevent runaway growth)
         max_mask_size = min(50000, reference_area * 3)
         
-        # Now propagate masks by transforming the previous mask, not creating new ones
+        # Now propagate masks by transforming the previous mask
         prev_frame = start_frame
         prev_mask = reference_mask
         
@@ -612,10 +695,10 @@ class SeismicPredictor:
                 
             # Get slice position for this frame position
             try:
-                position = self.demo_slice_indices[frame_pos]
-                print(f"Processing frame {frame_pos}, position {position}")
+                position = slice_indices[frame_pos]
+                print(f"Processing frame {frame_pos}, position {position} for Object {obj_id}")
             except (IndexError, TypeError) as e:
-                print(f"Error getting position for frame {frame_pos}: {e}")
+                print(f"Error getting position for frame {frame_pos} (Object {obj_id}): {e}")
                 continue
                 
             try:
@@ -630,11 +713,8 @@ class SeismicPredictor:
                 curr_h, curr_w = curr_slice.shape
                 
                 # Create a new mask by transforming the previous mask
-                # Start with the previous mask and apply slight changes
-                
                 # First, ensure previous mask size matches current slice
                 if prev_mask.shape != (curr_h, curr_w):
-                    # Resize previous mask to match current slice dimensions
                     temp_mask = np.zeros((curr_h, curr_w), dtype=bool)
                     min_h = min(prev_mask.shape[0], curr_h)
                     min_w = min(prev_mask.shape[1], curr_w)
@@ -644,69 +724,58 @@ class SeismicPredictor:
                 # Apply very minimal transformations to the mask - just slight shifts
                 from scipy import ndimage
                 
-                # For horizontal fault features in our pre-transposed data 
+                # Use different random shifts per object potentially? (Keep simple for now)
                 if self.current_slice_type in ["inline", "crossline"]:
-                    # For fault tracking, we want even more minimal displacement
-                    # Very small shifts to follow lateral continuity
-                    shift_x = np.random.randint(-2, 3) * 0.5  # Half-pixel horizontal shifts
-                    shift_y = np.random.randint(-1, 2) * 0.2  # Fifth-pixel vertical shifts (almost none)
+                    shift_x = np.random.randint(-2, 3) * 0.5
+                    shift_y = np.random.randint(-1, 2) * 0.2
                 else:
-                    # Small shifts for timeslices
                     shift_x = np.random.randint(-1, 2)
                     shift_y = np.random.randint(-1, 2)
                 
-                # Apply shift using ndimage - use order=0 for nearest neighbor interpolation
                 new_mask = ndimage.shift(prev_mask.astype(float), (shift_y, shift_x), order=0, mode='constant', cval=0.0) > 0.5
                 
-                # Enforce strict size constraints
+                # Enforce strict size constraints based on this object's reference area
+                current_reference_area = state_info.get('reference_mask_area', 10000) # Use object's ref area
                 new_area = np.count_nonzero(new_mask)
-                area_ratio = new_area / reference_area if reference_area > 0 else 1.0
+                area_ratio = new_area / current_reference_area if current_reference_area > 0 else 1.0
                 
                 # If mask deviates even slightly from reference size, adjust it
-                if area_ratio > 1.1 or area_ratio < 0.9:  # Only allow 10% variation
-                    print(f"Adjusting mask size, area ratio: {area_ratio:.2f}")
-                    
-                    if area_ratio > 1.1:  # Grown too much
-                        # Erode the mask to reduce size
+                if area_ratio > 1.1 or area_ratio < 0.9:
+                    print(f"Object {obj_id}: Adjusting mask size, area ratio: {area_ratio:.2f}")
+                    if area_ratio > 1.1:
                         iterations = 0
                         temp_mask = new_mask.copy()
-                        while np.count_nonzero(temp_mask) > 1.1 * reference_area and iterations < 5:
+                        while np.count_nonzero(temp_mask) > 1.1 * current_reference_area and iterations < 5:
                             temp_mask = ndimage.binary_erosion(temp_mask)
                             iterations += 1
                         new_mask = temp_mask
-                        
-                    elif area_ratio < 0.9:  # Shrunk too much
-                        # Dilate the mask to increase size
+                    elif area_ratio < 0.9:
                         iterations = 0
                         temp_mask = new_mask.copy()
-                        while np.count_nonzero(temp_mask) < 0.9 * reference_area and iterations < 5:
+                        while np.count_nonzero(temp_mask) < 0.9 * current_reference_area and iterations < 5:
                             temp_mask = ndimage.binary_dilation(temp_mask)
                             iterations += 1
                         new_mask = temp_mask
-                    
-                    # Check the final adjustment
                     new_area = np.count_nonzero(new_mask)
-                    new_ratio = new_area / reference_area
-                    print(f"After adjustment: area={new_area}, ratio={new_ratio:.2f}")
+                    new_ratio = new_area / current_reference_area
+                    print(f"Object {obj_id}: After adjustment: area={new_area}, ratio={new_ratio:.2f}")
                 
                 # If mask is still too big or there's another issue, restore from reference
                 if np.count_nonzero(new_mask) > max_mask_size:
-                    print(f"WARNING: Mask too large ({np.count_nonzero(new_mask)} pixels) - using reference mask")
-                    # Just use the reference mask with a small shift for this frame
-                    clean_shift_x = shift_x * 0.8  # Reduce shift magnitude
-                    clean_shift_y = 0  # No vertical shift
+                    print(f"WARNING (Object {obj_id}): Mask too large ({np.count_nonzero(new_mask)} pixels) - using reference mask")
+                    clean_shift_x = shift_x * 0.8
+                    clean_shift_y = 0
                     new_mask = ndimage.shift(reference_mask.astype(float), 
                                             (clean_shift_y, clean_shift_x), 
                                             order=0, mode='constant', cval=0.0) > 0.5
                 
                 # Store the mask for this frame - use position as key
-                self.demo_inference_state["output"][frame_pos] = {"mask": [new_mask]}
+                demo_inference_state["output"][frame_pos] = {"mask": [new_mask]}
                 prev_mask = new_mask
                 prev_frame = frame_pos
                 
             except Exception as e:
-                print(f"Error creating mask for frame {frame_pos}, position {position}: {e}")
-                # Create an empty mask as fallback
+                print(f"Error creating mask for frame {frame_pos}, position {position} (Object {obj_id}): {e}")
                 try:
                     if self.current_slice_type == "inline":
                         curr_slice = self.seismic_volume.get_inline_slice(position)
@@ -714,12 +783,11 @@ class SeismicPredictor:
                         curr_slice = self.seismic_volume.get_crossline_slice(position)
                     elif self.current_slice_type == "timeslice":
                         curr_slice = self.seismic_volume.get_timeslice(position)
-                    
                     empty_mask = np.zeros(curr_slice.shape, dtype=bool)
                 except Exception:
                     empty_mask = np.zeros((base_h, base_w), dtype=bool)
                 
-                self.demo_inference_state["output"][frame_pos] = {"mask": [empty_mask]}
+                demo_inference_state["output"][frame_pos] = {"mask": [empty_mask]}
     
     def _add_noise_to_mask_edges(self, mask):
         """Add noise to mask edges to simulate realistic SAM2 propagation"""
@@ -761,120 +829,110 @@ class SeismicPredictor:
         """
         if self.demo_mode:
             try:
-                if not hasattr(self, 'demo_inference_state'):
-                    print("Demo masks not generated yet")
+                # Use the demo state specific to this object ID
+                if obj_id not in self.demo_state or 'inference_state' not in self.demo_state[obj_id]:
+                    print(f"Demo masks not generated yet for Object {obj_id}")
                     return None
+                    
+                state_info = self.demo_state[obj_id]
+                demo_inference_state = state_info.get('inference_state')
                 
-                # Debug info about available frames
-                output_frames = list(self.demo_inference_state["output"].keys())
-                print(f"Looking for frame {frame_idx} in available frames: {output_frames[:10]}{'...' if len(output_frames) > 10 else ''}")
+                if demo_inference_state is None or "output" not in demo_inference_state:
+                     print(f"Demo inference state invalid for Object {obj_id}")
+                     return None
+
+                # Debug info about available frames for this object
+                output_frames = list(demo_inference_state["output"].keys())
+                print(f"Object {obj_id}: Looking for frame {frame_idx} in available frames: {output_frames[:10]}{'...' if len(output_frames) > 10 else ''}")
                 
-                # Keep track of the original mask area for reference
-                if not hasattr(self, 'reference_mask_area'):
-                    # Look for the earliest frame to establish reference size
-                    if len(output_frames) > 0:
-                        earliest_frame = min(output_frames)
-                        ref_mask = self.demo_inference_state["output"][earliest_frame]["mask"][0]
-                        self.reference_mask_area = np.count_nonzero(ref_mask)
-                        print(f"Established reference mask area: {self.reference_mask_area} pixels")
-                    else:
-                        self.reference_mask_area = 10000  # Default reasonable size
+                # Get reference area for this object
+                reference_area = state_info.get('reference_mask_area', 10000) 
                 
                 # First try exact frame index
-                if frame_idx in self.demo_inference_state["output"]:
-                    if self.demo_obj_id != obj_id:
-                        print(f"Object ID {obj_id} not found in demo mode (using {self.demo_obj_id})")
-                        # Use the demo object ID instead
-                        obj_id = self.demo_obj_id
-                        
-                    mask = self.demo_inference_state["output"][frame_idx]["mask"][0]
-                    print(f"Found exact mask for frame {frame_idx}")
+                if frame_idx in demo_inference_state["output"]:
+                    # Demo mode currently only supports one object ID per state
+                    # The obj_id check is implicit as we fetched the state for this obj_id
+                    mask = demo_inference_state["output"][frame_idx]["mask"][0]
+                    print(f"Found exact mask for frame {frame_idx} (Object {obj_id})")
                 else:
                     # Try to find the closest frame
-                    print(f"No mask for exact frame {frame_idx} in demo mode, looking for nearby frames")
+                    print(f"No mask for exact frame {frame_idx} in demo mode (Object {obj_id}), looking for nearby frames")
                     
-                    # Find closest available frame with increased search range (up to 30 frames)
+                    # Find closest available frame
                     closest_frame = None
                     min_dist = float('inf')
-                    search_range = 30  # Increased search range
+                    search_range = 30
                     
-                    for avail_frame in self.demo_inference_state["output"].keys():
+                    for avail_frame in demo_inference_state["output"].keys():
                         dist = abs(avail_frame - frame_idx)
                         if dist < min_dist and dist <= search_range:
                             min_dist = dist
                             closest_frame = avail_frame
                     
                     if closest_frame is not None:
-                        print(f"Using nearby frame {closest_frame} (distance: {min_dist})")
-                        mask = self.demo_inference_state["output"][closest_frame]["mask"][0]
+                        print(f"Using nearby frame {closest_frame} (distance: {min_dist}) for Object {obj_id}")
+                        mask = demo_inference_state["output"][closest_frame]["mask"][0]
                     else:
-                        print(f"No suitable nearby frame found within range {search_range}")
-                        # Generate a simple empty mask for the current slice shape
+                        print(f"No suitable nearby frame found for Object {obj_id} within range {search_range}")
                         if self.current_slice is not None:
                             return np.zeros(self.current_slice.shape, dtype=bool)
                         return None
                 
                 # Check if mask has grown too large - apply emergency size correction
                 mask_size = np.count_nonzero(mask)
-                mask_ratio = mask_size / self.reference_mask_area
+                mask_ratio = mask_size / reference_area if reference_area > 0 else 1.0
                 
-                if mask_size > 50000 or mask_ratio > 5.0:  # More than 5x original size or > 50k pixels
-                    print(f"WARNING: Mask too large ({mask_size} pixels, ratio: {mask_ratio:.1f}). Emergency correction applied.")
+                if mask_size > 50000 or mask_ratio > 5.0:
+                    print(f"WARNING (Object {obj_id}): Mask too large ({mask_size} pixels, ratio: {mask_ratio:.1f}). Emergency correction applied.")
                     from scipy import ndimage
                     
-                    # If it's a huge mask, it probably shouldn't be - extract the region near the fault
-                    if self.current_slice_type in ["inline", "crossline"]:
-                        # For inline/crossline, we expect horizontal features
-                        h, w = mask.shape
+                    # If it's a huge mask, try to find the reference mask and shift it
+                    ref_mask = None
+                    start_frame = state_info.get('frame_idx', 0)
+                    if start_frame in demo_inference_state["output"]:
+                        ref_mask = demo_inference_state["output"][start_frame]["mask"][0]
                         
-                        # Create a new mask focused on the region of interest
-                        new_mask = np.zeros_like(mask)
-                        
-                        # Assuming fault is roughly horizontal at ~1/3 down the image (where we saw it before)
-                        target_y = h // 3
-                        y_range = 100  # Extract region +/- 100 pixels vertically
-                        
-                        # Extract only the horizontal band where the fault should be
-                        top = max(0, target_y - y_range)
-                        bottom = min(h, target_y + y_range)
-                        
-                        # Only keep mask in this band
-                        new_mask[top:bottom, :] = mask[top:bottom, :]
-                        
-                        # If still too big, erode it
-                        while np.count_nonzero(new_mask) > 3 * self.reference_mask_area:
-                            new_mask = ndimage.binary_erosion(new_mask)
-                        
-                        mask = new_mask
-                        print(f"After correction: {np.count_nonzero(mask)} pixels")
-                
+                    if ref_mask is not None:
+                         # Shift reference mask slightly instead of using corrupted mask
+                         shift_x = np.random.randint(-1, 2)
+                         shift_y = 0
+                         mask = ndimage.shift(ref_mask.astype(float), (shift_y, shift_x), order=0, mode='constant', cval=0.0) > 0.5
+                         print(f"After correction (Object {obj_id}): {np.count_nonzero(mask)} pixels")
+                    else:
+                         # If reference not found, just erode current mask aggressively
+                         while np.count_nonzero(mask) > 1.5 * reference_area and np.count_nonzero(mask) > 100:
+                             mask = ndimage.binary_erosion(mask)
+                         print(f"After erosion correction (Object {obj_id}): {np.count_nonzero(mask)} pixels")
+
                 # Make sure the mask matches the current slice dimensions
                 if self.current_slice is not None and mask.shape != self.current_slice.shape:
-                    print(f"Resizing demo mask from {mask.shape} to {self.current_slice.shape}")
+                    print(f"Resizing demo mask from {mask.shape} to {self.current_slice.shape} (Object {obj_id})")
                     h, w = self.current_slice.shape
                     mask_h, mask_w = mask.shape
-                    
-                    # Create a new mask with current slice dimensions
                     resized_mask = np.zeros(self.current_slice.shape, dtype=bool)
-                    
-                    # Copy as much of the mask as possible
                     min_h = min(h, mask_h)
                     min_w = min(w, mask_w)
                     resized_mask[:min_h, :min_w] = mask[:min_h, :min_w]
-                    
                     return resized_mask
                     
                 return mask
             except Exception as e:
-                print(f"Error getting demo mask for frame {frame_idx}: {e}")
-                # Return an empty mask if there's an error
+                print(f"Error getting demo mask for frame {frame_idx}, Object {obj_id}: {e}")
                 if self.current_slice is not None:
                     return np.zeros(self.current_slice.shape, dtype=bool)
                 return None
             
-        if self.inference_state is None:
-            print("Video predictor not initialized")
-            return None
+        # --- Real Predictor Logic ---
+        if obj_id not in self.inference_state:
+             print(f"Video predictor not initialized for Object ID {obj_id}")
+             # Check if a manually generated mask exists for this slice/object
+             slice_key = f"{self.current_slice_type}_{self.current_slice_idx}"
+             if obj_id in self.object_masks and slice_key in self.object_masks[obj_id]:
+                 print(f"Returning generated mask for Object {obj_id} on slice {slice_key}")
+                 return self.object_masks[obj_id][slice_key]
+             return None # No state and no generated mask
+             
+        current_state = self.inference_state[obj_id]
         
         # Get the current slice to determine correct dimensions
         if self.current_slice is None:
@@ -883,13 +941,16 @@ class SeismicPredictor:
             
         current_slice_shape = self.current_slice.shape
         
-        # Check if the frame index is valid
+        # Check if the frame index is valid within the state for this object
         try:
-            # Get mask from the inference state
-            masks = self.inference_state["output"][frame_idx]["mask"]
-            mask_ids = self.inference_state["object_ids"]
+            # Get mask from the inference state for this object
+            if frame_idx not in current_state["output"]:
+                 raise KeyError # Frame not processed for this object
+                 
+            masks = current_state["output"][frame_idx]["mask"]
+            mask_ids = current_state["object_ids"]
             
-            # Find index for the requested object ID
+            # Find index for the requested object ID within this state
             obj_idx = None
             for i, mask_id in enumerate(mask_ids):
                 if mask_id == obj_id:
@@ -897,29 +958,28 @@ class SeismicPredictor:
                     break
                     
             if obj_idx is None:
-                print(f"Object ID {obj_id} not found in available masks")
-                return None
+                print(f"Object ID {obj_id} not found in masks for frame {frame_idx} in its state")
+                return np.zeros(current_slice_shape, dtype=bool) # Return empty mask with correct shape
                 
             mask = masks[obj_idx]
         except KeyError:
-            # Try to find the closest frame
-            print(f"Frame {frame_idx} not in processed frames, looking for nearby frames")
+            # Try to find the closest frame *within this object's state*
+            print(f"Frame {frame_idx} not in processed frames for Object {obj_id}, looking for nearby frames")
             closest_frame = None
             min_dist = float('inf')
             
-            # Try frames within 30 positions of the requested frame
             search_range = 30
-            for avail_frame in self.inference_state["output"].keys():
+            for avail_frame in current_state["output"].keys(): # Search keys in this object's state
                 dist = abs(avail_frame - frame_idx)
                 if dist < min_dist and dist <= search_range:
                     min_dist = dist
                     closest_frame = avail_frame
             
             if closest_frame is not None:
-                print(f"Using nearby frame {closest_frame} (distance: {min_dist})")
+                print(f"Using nearby frame {closest_frame} (distance: {min_dist}) for Object {obj_id}")
                 try:
-                    masks = self.inference_state["output"][closest_frame]["mask"]
-                    mask_ids = self.inference_state["object_ids"]
+                    masks = current_state["output"][closest_frame]["mask"]
+                    mask_ids = current_state["object_ids"]
                     
                     # Find index for the requested object ID
                     obj_idx = None
@@ -929,24 +989,17 @@ class SeismicPredictor:
                             break
                             
                     if obj_idx is None:
-                        print(f"Object ID {obj_id} not found in available masks")
+                        print(f"Object ID {obj_id} not found in available masks for nearby frame")
                         return np.zeros(current_slice_shape, dtype=bool)
                         
                     mask = masks[obj_idx]
                 except Exception as e:
-                    print(f"Error getting mask from nearby frame: {e}")
+                    print(f"Error getting mask from nearby frame for Object {obj_id}: {e}")
                     return np.zeros(current_slice_shape, dtype=bool)
-            else:
-                # If no nearby frame is found, return empty mask
-                print(f"No nearby frame found within range {search_range}")
-                return np.zeros(current_slice_shape, dtype=bool)
-        except Exception as e:
-            print(f"Error retrieving mask for frame {frame_idx}: {e}")
-            return np.zeros(current_slice_shape, dtype=bool)
-        
+                
         # Return a correctly sized mask for this slice
         if mask.shape != current_slice_shape:
-            print(f"Resizing mask from {mask.shape} to {current_slice_shape}")
+            print(f"Resizing mask from {mask.shape} to {current_slice_shape} (Object {obj_id})")
             try:
                 # If the mask is larger than the slice, crop it
                 h, w = current_slice_shape
