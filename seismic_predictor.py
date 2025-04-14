@@ -394,13 +394,12 @@ class SeismicPredictor:
         self.demo_state[obj_id]['labels'] = labels
         print(f"Set demo context for Object {obj_id}: frame={frame_idx}, {len(points)} points")
 
-    def init_video_predictor(self, slice_indices, obj_id, max_slices=None): # Accept obj_id
+    def init_video_predictor(self, slice_indices, obj_id):
         """Initialize the video predictor with a sequence of slices for a specific object
         
         Args:
             slice_indices: List of slice indices to use for propagation
             obj_id: The object ID this initialization is for
-            max_slices: Maximum number of slices to use (to limit memory usage)
         """
         if self.demo_mode:
             # In demo mode, store indices and other context per object ID
@@ -414,30 +413,10 @@ class SeismicPredictor:
             print(f"Demo mode: Initialized video predictor for Object {obj_id} with {len(slice_indices)} frames")
             return True
             
-        # Limit the number of slices if needed
-        if max_slices and len(slice_indices) > max_slices:
-            print(f"Limiting to {max_slices} slices for performance")
-            # Take slices centered around the current one
-            current_idx = self.current_slice_idx
-            current_pos = slice_indices.index(current_idx) if current_idx in slice_indices else len(slice_indices) // 2
-            
-            # Calculate start and end indices
-            half_window = max_slices // 2
-            start_pos = max(0, current_pos - half_window)
-            end_pos = min(len(slice_indices), current_pos + half_window)
-            
-            # Adjust if window is too small on either side
-            if end_pos - start_pos < max_slices:
-                if start_pos == 0:
-                    end_pos = min(max_slices, len(slice_indices))
-                elif end_pos == len(slice_indices):
-                    start_pos = max(0, len(slice_indices) - max_slices)
-            
-            # Select the subset of slices
-            self.selected_slice_indices = slice_indices[start_pos:end_pos]
-            print(f"Using slices {start_pos} to {end_pos} (centered around current slice)")
-        else:
-            self.selected_slice_indices = slice_indices
+        # --- Real Predictor Path ---
+        # REMOVED max_slices logic - process all provided slice_indices
+        self.selected_slice_indices = slice_indices 
+        print(f"Initializing predictor for {len(self.selected_slice_indices)} slices.")
             
         # Create a "video" from the sequence of slices
         frames = []

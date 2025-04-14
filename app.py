@@ -619,103 +619,49 @@ class SeismicApp(ttk.Frame):
                 
             print(f"Using {'demo' if use_demo_mode else 'real'} mode for propagation")
             
-            # In demo mode, use position indices (0 to len-1) to avoid out of range errors
-            if use_demo_mode:
-                # Store a subset of position indices for demo mode
-                MAX_SLICES = 100
-                if slice_count > MAX_SLICES:
-                    # Center around current slice
-                    half_window = MAX_SLICES // 2
-                    start_pos = max(0, current_frame_pos - half_window)
-                    end_pos = min(slice_count, start_pos + MAX_SLICES)
-                    
-                    # Adjust if we're at the edge
-                    if end_pos - start_pos < MAX_SLICES:
-                        start_pos = max(0, end_pos - MAX_SLICES)
-                        
-                    # Use position indices, not actual slice indices
-                    demo_slices = list(range(start_pos, end_pos))
+            # Use the full range of slices, regardless of demo or real mode
+            slices_to_process = slices # slices is already list(range(slice_count))
+            print(f"Processing all {len(slices_to_process)} slices for propagation.")
+
+            # Initialize video predictor with the full slice list
+            self.queue.put(("status", "Initializing video predictor..."))
+            self.queue.put(("progress", 20))
+            
+            try:
+                if use_demo_mode:
+                     self.predictor.demo_mode = True # Ensure demo mode is set
+                     self.predictor.init_video_predictor(slices_to_process, obj_id) # Pass full list
                 else:
-                    demo_slices = list(range(slice_count))
-                    
-                print(f"Using {len(demo_slices)} slices for demo mode propagation, centered around position {current_frame_pos}")
-                print(f"Demo slices positions (first 5): {demo_slices[:5]}")
-                    
-                # Initialize video predictor with position indices
-                self.queue.put(("status", "Initializing video predictor..."))
-                self.queue.put(("progress", 20))
-                
+                     # Pass full list, remove max_slices limit from predictor if it exists there too
+                     self.predictor.init_video_predictor(slices_to_process, obj_id) 
+            except Exception as e:
+                self.queue.put(("error", f"Error initializing video predictor: {str(e)}"))
+                # Handle fallback if needed (e.g., retry with demo)
                 try:
-                    # In demo mode, we're using position indices
-                    self.predictor.demo_mode = True  # Force demo mode
-                    self.predictor.init_video_predictor(demo_slices, obj_id) # Pass obj_id
-                except Exception as e:
-                    self.queue.put(("error", f"Error initializing video predictor: {str(e)}"))
+                    print("Falling back to demo mode for initialization due to error.")
+                    self.predictor.demo_mode = True
+                    self.predictor.init_video_predictor(slices_to_process, obj_id)
+                    use_demo_mode = True
+                except Exception as retry_e:
+                    self.queue.put(("error", f"Also failed with demo mode init: {str(retry_e)}"))
                     self.queue.put(("progress", 0))
                     return
-                
-                # Add points to current frame
-                # Find the index of the current slice in our demo slices
-                try:
-                    # Current frame position relative to demo slices
-                    if current_frame_pos in demo_slices:
-                        # Use list.index() to find the position in demo_slices
-                        relative_pos = demo_slices.index(current_frame_pos)
-                        print(f"Current position {current_frame_pos} found at index {relative_pos} in demo_slices")
-                    else:
-                        # Find closest position manually
-                        closest_pos = None
-                        min_diff = float('inf')
-                        for i, pos in enumerate(demo_slices):
-                            diff = abs(pos - current_frame_pos)
-                            if diff < min_diff:
-                                min_diff = diff
-                                closest_pos = pos
-                                relative_pos = i
-                        
-                        current_frame_pos = relative_pos  # Use position within demo_slices
-                        self.queue.put(("status", f"Using closest position {closest_pos} instead of {current_frame_idx}"))
-                        print(f"Using closest position {closest_pos} at index {relative_pos} in demo_slices")
-                except Exception as e:
-                    self.queue.put(("error", f"Error finding frame position: {str(e)}"))
-                    self.queue.put(("progress", 0))
-                    return
-            else:
-                # Initialize video predictor - for non-demo mode we still use position indices
-                self.queue.put(("status", "Initializing video predictor..."))
-                self.queue.put(("progress", 20))
-                
-                # Limit to a reasonable number of slices to prevent memory issues
-                MAX_SLICES = 100
-                
-                try:
-                    self.predictor.init_video_predictor(slices, obj_id, max_slices=MAX_SLICES) # Pass obj_id
-                except Exception as e:
-                    self.queue.put(("error", f"Error initializing video predictor: {str(e)}"))
-                    print("Falling back to demo mode for propagation")
-                    
-                    # Retry with demo mode
-                    try:
-                        self.predictor.demo_mode = True
-                        self.predictor.init_video_predictor(slices[:MAX_SLICES], obj_id) # Pass obj_id
-                        use_demo_mode = True
-                    except Exception as retry_e:
-                        self.queue.put(("error", f"Also failed with demo mode: {str(retry_e)}"))
-                        self.queue.put(("progress", 0))
-                        return
-                
-                # Find frame position in the selected slices
-                if not use_demo_mode and hasattr(self.predictor, 'slice_to_frame_map'):
-                    if current_frame_idx in self.predictor.slice_to_frame_map:
-                        current_frame_pos = self.predictor.slice_to_frame_map[current_frame_idx]
-                    else:
-                        # If the current slice wasn't included in the processing, find the closest one
-                        self.queue.put(("error", f"Current slice {current_frame_idx} not included in processing. Try a different slice."))
-                        self.queue.put(("progress", 0))
-                        return
             
-            obj_id = self.current_object_id.get()
-            
+            # --- Find starting frame position ---
+            # The frame position is simply the index in the full list `slices_to_process`
+            # which corresponds directly to the slice index `current_frame_idx`
+            # No complex relative positioning needed when using the full list.
+            current_frame_pos = current_frame_idx 
+            if not (0 <= current_frame_pos < len(slices_to_process)):
+                 # This shouldn't happen if slices_to_process covers the full range 0 to slice_count-1
+                 self.queue.put(("error", f"Frame position {current_frame_pos} is out of range [0, {len(slices_to_process)-1}]."))
+                 self.queue.put(("progress", 0))
+                 return
+            print(f"Using frame position {current_frame_pos} for starting propagation.")
+
+            # --- Continue with adding points and propagating ---
+            # obj_id = self.current_object_id.get() # Already defined earlier
+
             self.queue.put(("status", f"Adding points for Object {obj_id} to frame {current_frame_idx} (position {current_frame_pos})..."))
             self.queue.put(("progress", 30))
             
@@ -1098,104 +1044,45 @@ class SeismicApp(ttk.Frame):
                 
             print(f"Using {'demo' if use_demo_mode else 'real'} mode for propagation")
             
-            # In demo mode, use position indices (0 to len-1) to avoid out of range errors
-            if use_demo_mode:
-                # Store a subset of position indices for demo mode
-                # For visualization, ensure we cover the full range needed
-                MAX_SLICES = max(200, num_slices * 2)  # Ensure wide coverage for visualization
-                if slice_count > MAX_SLICES:
-                    # Center around current slice
-                    half_window = MAX_SLICES // 2
-                    start_pos = max(0, current_frame_pos - half_window)
-                    end_pos = min(slice_count, start_pos + MAX_SLICES)
-                    
-                    # Adjust if we're at the edge
-                    if end_pos - start_pos < MAX_SLICES:
-                        start_pos = max(0, end_pos - MAX_SLICES)
-                        
-                    # Use position indices, not actual slice indices
-                    demo_slices = list(range(start_pos, end_pos))
+            # Use the full range of slices, regardless of demo or real mode
+            slices_to_process = slices # slices is already list(range(slice_count))
+            print(f"Processing all {len(slices_to_process)} slices for propagation (visualization).")
+
+            # Initialize video predictor with the full slice list
+            self.queue.put(("status", "Initializing video predictor..."))
+            self.queue.put(("progress", 20))
+
+            try:
+                if use_demo_mode:
+                    self.predictor.demo_mode = True # Ensure demo mode is set
+                    self.predictor.init_video_predictor(slices_to_process, obj_id) # Pass full list
                 else:
-                    demo_slices = list(range(slice_count))
-                    
-                print(f"Using {len(demo_slices)} slices for demo mode propagation, centered around position {current_frame_pos}")
-                print(f"Demo slices positions (first 5): {demo_slices[:5]}")
-                    
-                # Initialize video predictor with position indices
-                self.queue.put(("status", "Initializing video predictor..."))
-                self.queue.put(("progress", 20))
-                
+                    # Pass full list, remove max_slices limit from predictor if it exists there too
+                    self.predictor.init_video_predictor(slices_to_process, obj_id)
+            except Exception as e:
+                self.queue.put(("error", f"Error initializing video predictor: {str(e)}"))
+                # Handle fallback if needed (e.g., retry with demo)
                 try:
-                    # In demo mode, we're using position indices
-                    self.predictor.demo_mode = True  # Force demo mode
-                    self.predictor.init_video_predictor(demo_slices, obj_id) # Pass obj_id
-                except Exception as e:
-                    self.queue.put(("error", f"Error initializing video predictor: {str(e)}"))
-                    self.queue.put(("progress", 0))
-                    return
-                
-                # Add points to current frame
-                # Find the index of the current slice in our demo slices
-                try:
-                    # Current frame position relative to demo slices
-                    if current_frame_pos in demo_slices:
-                        # Use list.index() to find the position in demo_slices
-                        relative_pos = demo_slices.index(current_frame_pos)
-                        print(f"Current position {current_frame_pos} found at index {relative_pos} in demo_slices")
-                    else:
-                        # Find closest position manually
-                        closest_pos = None
-                        min_diff = float('inf')
-                        for i, pos in enumerate(demo_slices):
-                            diff = abs(pos - current_frame_pos)
-                            if diff < min_diff:
-                                min_diff = diff
-                                closest_pos = pos
-                                relative_pos = i
-                        
-                        current_frame_pos = relative_pos  # Use position within demo_slices
-                        self.queue.put(("status", f"Using closest position {closest_pos} instead of {current_frame_idx}"))
-                        print(f"Using closest position {closest_pos} at index {relative_pos} in demo_slices")
-                except Exception as e:
-                    self.queue.put(("error", f"Error finding frame position: {str(e)}"))
-                    self.queue.put(("progress", 0))
-                    return
-            else:
-                # Initialize video predictor - for non-demo mode we still use position indices
-                self.queue.put(("status", "Initializing video predictor..."))
-                self.queue.put(("progress", 20))
-                
-                # Limit to a reasonable number of slices to prevent memory issues
-                MAX_SLICES = max(200, num_slices * 2)  # Ensure wide coverage for visualization
-                
-                try:
-                    self.predictor.init_video_predictor(slices, obj_id, max_slices=MAX_SLICES) # Pass obj_id
-                except Exception as e:
-                    self.queue.put(("error", f"Error initializing video predictor: {str(e)}"))
-                    print("Falling back to demo mode for propagation")
-                    
-                    # Retry with demo mode
-                    try:
-                        self.predictor.demo_mode = True
-                        self.predictor.init_video_predictor(slices[:MAX_SLICES], obj_id) # Pass obj_id
-                        use_demo_mode = True
-                    except Exception as retry_e:
-                        self.queue.put(("error", f"Also failed with demo mode: {str(retry_e)}"))
-                        self.queue.put(("progress", 0))
-                        return
-                
-                # Find frame position in the selected slices
-                if not use_demo_mode and hasattr(self.predictor, 'slice_to_frame_map'):
-                    if current_frame_idx in self.predictor.slice_to_frame_map:
-                        current_frame_pos = self.predictor.slice_to_frame_map[current_frame_idx]
-                    else:
-                        # If the current slice wasn't included in the processing, find the closest one
-                        self.queue.put(("error", f"Current slice {current_frame_idx} not included in processing. Try a different slice."))
-                        self.queue.put(("progress", 0))
-                        return
+                     print("Falling back to demo mode for initialization due to error.")
+                     self.predictor.demo_mode = True
+                     self.predictor.init_video_predictor(slices_to_process, obj_id)
+                     use_demo_mode = True
+                except Exception as retry_e:
+                     self.queue.put(("error", f"Also failed with demo mode init: {str(retry_e)}"))
+                     self.queue.put(("progress", 0))
+                     return
+
+            # --- Find starting frame position ---
+            current_frame_pos = current_frame_idx
+            if not (0 <= current_frame_pos < len(slices_to_process)):
+                self.queue.put(("error", f"Frame position {current_frame_pos} is out of range [0, {len(slices_to_process)-1}]."))
+                self.queue.put(("progress", 0))
+                return
+            print(f"Using frame position {current_frame_pos} for starting propagation (visualization).")
             
-            obj_id = self.current_object_id.get()
-            
+            # --- Continue with adding points and propagating ---
+            # obj_id = self.current_object_id.get() # Already defined earlier
+
             self.queue.put(("status", f"Adding points for Object {obj_id} to frame {current_frame_idx} (position {current_frame_pos})..."))
             self.queue.put(("progress", 30))
             
