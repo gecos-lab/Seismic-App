@@ -1,18 +1,37 @@
 import os
 import sys
 import numpy as np
+
+# Set environment variables for Qt and matplotlib before any Qt imports
+os.environ['QT_API'] = 'pyside6'
+os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = ''  # Let Qt find plugins automatically
+os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
+
+# Set matplotlib to use the correct Qt backend for PySide6
+import matplotlib
+matplotlib.use('QtAgg')  # Use QtAgg for better PySide6 compatibility
+
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from PIL import Image, ImageTk
+
+# Import Qt backend for matplotlib
+try:
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+except ImportError:
+    # Fallback for older matplotlib versions
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                               QHBoxLayout, QGridLayout, QLabel, QPushButton, 
+                               QSlider, QLineEdit, QSpinBox, QRadioButton, 
+                               QButtonGroup, QProgressBar, QMenuBar, QMenu, 
+                               QMessageBox, QFileDialog, QFrame, QSizePolicy,
+                               QGroupBox, QCheckBox, QInputDialog)
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtGui import QAction, QPixmap
 import threading
 import queue
 import argparse
-# setting proper environment
-os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 
 # Add parent directory to path for importing our modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -50,12 +69,18 @@ except ImportError:
 # Debug statement to show whether LoopStructural is available
 print(f"LoopStructural available: {LOOPSTRUCTURAL_AVAILABLE}")
 
-class SeismicApp(ttk.Frame):
-    def __init__(self, master=None, segy_path=None, demo_mode=False, model_id=None):
-        super().__init__(master)
-        self.master = master
-        self.master.title("Seismic Interpretation App")
-        self.pack(fill=tk.BOTH, expand=True)
+class SeismicApp(QMainWindow):
+    # Define custom signals for thread communication
+    status_updated = Signal(str)
+    progress_updated = Signal(float)
+    error_occurred = Signal(str)
+    scale_updated = Signal(int)
+    mask_ready = Signal(object)
+    
+    def __init__(self, segy_path=None, demo_mode=False, model_id=None):
+        super().__init__()
+        self.setWindowTitle("Seismic Interpretation App")
+        self.setGeometry(100, 100, 1200, 800)
         
         # Initialize the seismic predictor with SAM2 model
         # Set demo_mode=False to use the real model when available
@@ -71,163 +96,365 @@ class SeismicApp(ttk.Frame):
         # Initialize seismic data
         self.segy_loader = SegyLoader()
         
-        self.current_slice_type = tk.StringVar(value="inline")
-        self.current_slice_idx = tk.IntVar(value=0)
-        self.current_object_id = tk.IntVar(value=1)
+        # Convert StringVar and IntVar to regular variables with property-like access
+        self._current_slice_type = "inline"
+        self._current_slice_idx = 0
+        self._current_object_id = 1
+        self._drawing_mode = "foreground"
+        self._status_text = "Ready. Load a SEGY file to begin."
+        self._progress_value = 0.0
         
         # Initialize point collection per object ID
         self.object_annotations = {} # Stores {'points': [], 'labels': []} for each object ID
         
-        # Add back the drawing_mode initialization
-        self.drawing_mode = tk.StringVar(value="foreground")  # or "background"
-        
-        # Status variables
-        self.status_text = tk.StringVar(value="Ready. Load a SEGY file to begin.")
-        self.progress_var = tk.DoubleVar(value=0.0)
-        
-        # Message queue for thread communication
+        # Message queue for thread communication (keeping for compatibility)
         self.queue = queue.Queue()
+        
+        # Create central widget and main layout
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        self.main_layout = QVBoxLayout(central_widget)
         
         # Create GUI
         self._create_menu()
         self._create_main_layout()
         
-        # Bind events
-        self._bind_events()
+        # Connect signals
+        self._connect_signals()
         
         # Start with model loading
         self._load_model()
         
-        # Start queue processing
-        self.process_queue()
+        # Start queue processing with QTimer
+        self.queue_timer = QTimer()
+        self.queue_timer.timeout.connect(self.process_queue)
+        self.queue_timer.start(100)  # Process queue every 100ms
+    
+    # Property methods to maintain compatibility with original code
+    @property
+    def current_slice_type(self):
+        class MockVar:
+            def __init__(self, value):
+                self.value = value
+            def get(self):
+                return self.value
+            def set(self, value):
+                self.value = value
+        return MockVar(self._current_slice_type)
+    
+    @property 
+    def current_slice_idx(self):
+        class MockVar:
+            def __init__(self, parent):
+                self.parent = parent
+            def get(self):
+                return self.parent._current_slice_idx
+            def set(self, value):
+                self.parent._current_slice_idx = value
+                if hasattr(self.parent, 'slice_slider'):
+                    self.parent.slice_slider.setValue(value)
+        return MockVar(self)
+    
+    @property
+    def current_object_id(self):
+        class MockVar:
+            def __init__(self, parent):
+                self.parent = parent
+            def get(self):
+                return self.parent._current_object_id
+            def set(self, value):
+                self.parent._current_object_id = value
+                if hasattr(self.parent, 'object_id_spinbox'):
+                    self.parent.object_id_spinbox.setValue(value)
+        return MockVar(self)
+    
+    @property
+    def drawing_mode(self):
+        class MockVar:
+            def __init__(self, parent):
+                self.parent = parent
+            def get(self):
+                return self.parent._drawing_mode
+            def set(self, value):
+                self.parent._drawing_mode = value
+        return MockVar(self)
+    
+    @property
+    def status_text(self):
+        class MockVar:
+            def __init__(self, parent):
+                self.parent = parent
+            def get(self):
+                return self.parent._status_text
+            def set(self, value):
+                self.parent._status_text = value
+                if hasattr(self.parent, 'status_label'):
+                    self.parent.status_label.setText(value)
+        return MockVar(self)
+    
+    @property
+    def progress_var(self):
+        class MockVar:
+            def __init__(self, parent):
+                self.parent = parent
+            def get(self):
+                return self.parent._progress_value
+            def set(self, value):
+                self.parent._progress_value = value
+                if hasattr(self.parent, 'progress_bar'):
+                    self.parent.progress_bar.setValue(int(value))
+        return MockVar(self)
         
     def _create_menu(self):
         """Create application menu"""
-        menubar = tk.Menu(self.master)
+        menubar = self.menuBar()
         
         # File menu
-        file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="Open SEGY...", command=self._open_segy_file)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.master.quit)
-        menubar.add_cascade(label="File", menu=file_menu)
+        file_menu = menubar.addMenu("File")
+        
+        open_action = QAction("Open SEGY...", self)
+        open_action.triggered.connect(self._open_segy_file)
+        file_menu.addAction(open_action)
+        
+        file_menu.addSeparator()
+        
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
         
         # Slice menu
-        slice_menu = tk.Menu(menubar, tearoff=0)
-        slice_menu.add_radiobutton(label="Inline", variable=self.current_slice_type, 
-                                  value="inline", command=self._update_slice_view)
-        slice_menu.add_radiobutton(label="Crossline", variable=self.current_slice_type, 
-                                  value="crossline", command=self._update_slice_view)
-        slice_menu.add_radiobutton(label="Time/Depth", variable=self.current_slice_type, 
-                                  value="timeslice", command=self._update_slice_view)
-        menubar.add_cascade(label="Slice Type", menu=slice_menu)
+        slice_menu = menubar.addMenu("Slice Type")
+        
+        # Create action group for radio button behavior
+        slice_group = QButtonGroup(self)
+        
+        inline_action = QAction("Inline", self)
+        inline_action.setCheckable(True)
+        inline_action.setChecked(True)
+        inline_action.triggered.connect(lambda: self._set_slice_type("inline"))
+        slice_menu.addAction(inline_action)
+        slice_group.addButton(QPushButton())  # Placeholder for grouping
+        
+        crossline_action = QAction("Crossline", self)
+        crossline_action.setCheckable(True)
+        crossline_action.triggered.connect(lambda: self._set_slice_type("crossline"))
+        slice_menu.addAction(crossline_action)
+        
+        timeslice_action = QAction("Time/Depth", self)
+        timeslice_action.setCheckable(True)
+        timeslice_action.triggered.connect(lambda: self._set_slice_type("timeslice"))
+        slice_menu.addAction(timeslice_action)
+        
+        # Store actions for later reference
+        self.slice_actions = [inline_action, crossline_action, timeslice_action]
         
         # SAM2 menu
-        sam2_menu = tk.Menu(menubar, tearoff=0)
-        sam2_menu.add_command(label="Clear Current Annotations", command=self._clear_annotations)
-        sam2_menu.add_command(label="Propagate to All Slices", command=self._propagate_to_all)
-        # Add 3D Visualization option to the menu
-        sam2_menu.add_command(label="Open 3D Visualization", command=self._open_3d_visualization)
-        # Add 3D Surface Generation option to the menu
-        sam2_menu.add_command(label="Generate 3D Surface", command=self._open_3d_surface_generation)
-        menubar.add_cascade(label="SAM2", menu=sam2_menu)
+        sam2_menu = menubar.addMenu("SAM2")
+        
+        clear_action = QAction("Clear Current Annotations", self)
+        clear_action.triggered.connect(self._clear_annotations)
+        sam2_menu.addAction(clear_action)
+        
+        propagate_action = QAction("Propagate to All Slices", self)
+        propagate_action.triggered.connect(self._propagate_to_all)
+        sam2_menu.addAction(propagate_action)
+        
+        viz_3d_action = QAction("Open 3D Visualization", self)
+        viz_3d_action.triggered.connect(self._open_3d_visualization)
+        sam2_menu.addAction(viz_3d_action)
+        
+        surface_3d_action = QAction("Generate 3D Surface", self)
+        surface_3d_action.triggered.connect(self._open_3d_surface_generation)
+        sam2_menu.addAction(surface_3d_action)
         
         # Help menu
-        help_menu = tk.Menu(menubar, tearoff=0)
-        help_menu.add_command(label="About", command=self._show_about)
-        help_menu.add_command(label="Instructions", command=self._show_instructions)
-        menubar.add_cascade(label="Help", menu=help_menu)
+        help_menu = menubar.addMenu("Help")
         
-        self.master.config(menu=menubar)
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
+        
+        instructions_action = QAction("Instructions", self)
+        instructions_action.triggered.connect(self._show_instructions)
+        help_menu.addAction(instructions_action)
+    
+    def _set_slice_type(self, slice_type):
+        """Handle slice type change from menu"""
+        self._current_slice_type = slice_type
+        # Update radio button states
+        type_map = {"inline": 0, "crossline": 1, "timeslice": 2}
+        for i, action in enumerate(self.slice_actions):
+            action.setChecked(i == type_map[slice_type])
+        self._update_slice_view()
     
     def _create_main_layout(self):
         """Create the main application layout"""
-        # Main frame
-        main_frame = ttk.Frame(self.master)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
         # Top control panel
-        control_frame = ttk.LabelFrame(main_frame, text="Controls")
-        control_frame.pack(fill=tk.X, pady=(0, 10))
+        control_group = QGroupBox("Controls")
+        control_layout = QHBoxLayout(control_group)
         
         # Slice controls
-        slice_frame = ttk.Frame(control_frame)
-        slice_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5, pady=5)
+        slice_widget = QWidget()
+        slice_layout = QHBoxLayout(slice_widget)
+        slice_layout.addWidget(QLabel("Slice Index:"))
         
-        ttk.Label(slice_frame, text="Slice Index:").pack(side=tk.LEFT, padx=(0, 5))
-        self.slice_scale = ttk.Scale(slice_frame, from_=0, to=100, 
-                                     variable=self.current_slice_idx,
-                                     command=self._on_slice_change)
-        self.slice_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.slice_slider = QSlider(Qt.Horizontal)
+        self.slice_slider.setMinimum(0)
+        self.slice_slider.setMaximum(100)
+        self.slice_slider.setValue(0)
+        self.slice_slider.valueChanged.connect(self._on_slice_change)
+        slice_layout.addWidget(self.slice_slider, 1)  # stretch factor 1
         
-        self.slice_entry = ttk.Entry(slice_frame, width=5, textvariable=self.current_slice_idx)
-        self.slice_entry.pack(side=tk.LEFT, padx=5)
-        self.slice_entry.bind("<Return>", self._on_slice_entry_change)
+        self.slice_entry = QLineEdit()
+        self.slice_entry.setMaximumWidth(60)
+        self.slice_entry.setText("0")
+        self.slice_entry.returnPressed.connect(self._on_slice_entry_change)
+        slice_layout.addWidget(self.slice_entry)
+        
+        control_layout.addWidget(slice_widget, 1)
         
         # Annotation controls
-        annot_frame = ttk.LabelFrame(control_frame, text="Annotation")
-        annot_frame.pack(side=tk.LEFT, fill=tk.X, padx=5, pady=5)
+        annot_group = QGroupBox("Annotation")
+        annot_layout = QHBoxLayout(annot_group)
         
-        ttk.Radiobutton(annot_frame, text="Foreground", variable=self.drawing_mode, 
-                       value="foreground").pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(annot_frame, text="Background", variable=self.drawing_mode, 
-                       value="background").pack(side=tk.LEFT, padx=5)
+        # Radio buttons for drawing mode
+        self.drawing_mode_group = QButtonGroup(self)
+        self.foreground_radio = QRadioButton("Foreground")
+        self.background_radio = QRadioButton("Background")
+        self.foreground_radio.setChecked(True)
         
-        ttk.Label(annot_frame, text="Object ID:").pack(side=tk.LEFT, padx=(10, 5))
-        self.object_id_spinbox = ttk.Spinbox(annot_frame, from_=1, to=10, width=3, 
-                                            textvariable=self.current_object_id,
-                                            command=self._on_object_id_change) # Add command
-        self.object_id_spinbox.pack(side=tk.LEFT, padx=5)
-        self.object_id_spinbox.bind("<Return>", self._on_object_id_change) # Bind Return key
+        self.drawing_mode_group.addButton(self.foreground_radio, 0)
+        self.drawing_mode_group.addButton(self.background_radio, 1)
+        self.drawing_mode_group.buttonClicked.connect(self._on_drawing_mode_change)
+        
+        annot_layout.addWidget(self.foreground_radio)
+        annot_layout.addWidget(self.background_radio)
+        
+        annot_layout.addWidget(QLabel("Object ID:"))
+        self.object_id_spinbox = QSpinBox()
+        self.object_id_spinbox.setMinimum(1)
+        self.object_id_spinbox.setMaximum(10)
+        self.object_id_spinbox.setValue(1)
+        self.object_id_spinbox.valueChanged.connect(self._on_object_id_change)
+        annot_layout.addWidget(self.object_id_spinbox)
+        
+        control_layout.addWidget(annot_group)
         
         # Action buttons
-        action_frame = ttk.Frame(control_frame)
-        action_frame.pack(side=tk.LEFT, fill=tk.X, padx=5, pady=5)
+        action_widget = QWidget()
+        action_layout = QHBoxLayout(action_widget)
         
-        ttk.Button(action_frame, text="Generate Mask", 
-                  command=self._generate_mask).pack(side=tk.LEFT, padx=5)
-        ttk.Button(action_frame, text="Clear Points", 
-                  command=self._clear_annotations).pack(side=tk.LEFT, padx=5)
-        ttk.Button(action_frame, text="Propagate", 
-                  command=self._propagate_to_all).pack(side=tk.LEFT, padx=5)
-        # Add 3D Visualization button
-        ttk.Button(action_frame, text="3D View", 
-                  command=self._open_3d_visualization).pack(side=tk.LEFT, padx=5)
-        # Add Surface Generation button
-        ttk.Button(action_frame, text="3D Surface", 
-                  command=self._open_3d_surface_generation).pack(side=tk.LEFT, padx=5)
+        generate_btn = QPushButton("Generate Mask")
+        generate_btn.clicked.connect(self._generate_mask)
+        action_layout.addWidget(generate_btn)
+        
+        clear_btn = QPushButton("Clear Points")
+        clear_btn.clicked.connect(self._clear_annotations)
+        action_layout.addWidget(clear_btn)
+        
+        propagate_btn = QPushButton("Propagate")
+        propagate_btn.clicked.connect(self._propagate_to_all)
+        action_layout.addWidget(propagate_btn)
+        
+        viz_3d_btn = QPushButton("3D View")
+        viz_3d_btn.clicked.connect(self._open_3d_visualization)
+        action_layout.addWidget(viz_3d_btn)
+        
+        surface_3d_btn = QPushButton("3D Surface")
+        surface_3d_btn.clicked.connect(self._open_3d_surface_generation)
+        action_layout.addWidget(surface_3d_btn)
+        
+        save_3d_view_btn = QPushButton("Save 3D View...")
+        save_3d_view_btn.clicked.connect(self._prompt_and_save_3d_view)
+        action_layout.addWidget(save_3d_view_btn)
+        
+        save_3d_surface_btn = QPushButton("Save 3D Surface...")
+        save_3d_surface_btn.clicked.connect(self._prompt_and_save_3d_surface)
+        action_layout.addWidget(save_3d_surface_btn)
+        
+        control_layout.addWidget(action_widget)
+        
+        self.main_layout.addWidget(control_group)
         
         # Canvas for displaying the slice and annotations
-        canvas_frame = ttk.Frame(main_frame)
-        canvas_frame.pack(fill=tk.BOTH, expand=True)
+        canvas_widget = QWidget()
+        canvas_layout = QVBoxLayout(canvas_widget)
         
         # Create figure and canvas for seismic display
         self.fig = Figure(figsize=(10, 8), dpi=100)
         self.ax = self.fig.add_subplot(111)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=canvas_frame)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas = FigureCanvasQTAgg(self.fig)
+        canvas_layout.addWidget(self.canvas)
         
         # Add toolbar
-        self.toolbar = NavigationToolbar2Tk(self.canvas, canvas_frame)
-        self.toolbar.update()
+        self.toolbar = NavigationToolbar2QT(self.canvas, self)
+        canvas_layout.addWidget(self.toolbar)
+        
+        self.main_layout.addWidget(canvas_widget, 1)  # stretch factor 1
         
         # Status bar at bottom
-        status_frame = ttk.Frame(main_frame)
-        status_frame.pack(fill=tk.X, pady=(10, 0))
+        status_widget = QWidget()
+        status_layout = QHBoxLayout(status_widget)
         
-        self.progress_bar = ttk.Progressbar(status_frame, variable=self.progress_var, 
-                                           mode='determinate', length=200)
-        self.progress_bar.pack(side=tk.LEFT, padx=(0, 10))
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumWidth(200)
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setMaximum(100)
+        status_layout.addWidget(self.progress_bar)
         
-        ttk.Label(status_frame, textvariable=self.status_text).pack(side=tk.LEFT, fill=tk.X)
+        self.status_label = QLabel("Ready. Load a SEGY file to begin.")
+        status_layout.addWidget(self.status_label, 1)  # stretch factor 1
+        
+        self.main_layout.addWidget(status_widget)
     
-    def _bind_events(self):
-        """Bind events to widgets"""
+    def _on_drawing_mode_change(self, button):
+        """Handle drawing mode radio button change"""
+        if button == self.foreground_radio:
+            self._drawing_mode = "foreground"
+        else:
+            self._drawing_mode = "background"
+    
+    def _connect_signals(self):
+        """Connect Qt signals to slots"""
         # Canvas click events for annotations
         self.canvas.mpl_connect('button_press_event', self._on_canvas_click)
         
-        # Window close event
-        self.master.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Connect custom signals
+        self.status_updated.connect(self._update_status)
+        self.progress_updated.connect(self._update_progress)
+        self.error_occurred.connect(self._show_error)
+        self.scale_updated.connect(self._update_scale)
+        self.mask_ready.connect(self._display_mask)
+    
+    def _update_status(self, text):
+        """Update status label"""
+        self.status_label.setText(text)
+    
+    def _update_progress(self, value):
+        """Update progress bar"""
+        self.progress_bar.setValue(int(value))
+    
+    def _show_error(self, message):
+        """Show error message"""
+        QMessageBox.critical(self, "Error", message)
+        self.status_label.setText("Error occurred.")
+        self.progress_bar.setValue(0)
+    
+    def _update_scale(self, max_value):
+        """Update slice slider maximum"""
+        self.slice_slider.setMaximum(max_value)
+        self._load_current_slice()
+    
+    def _display_mask(self, mask):
+        """Display mask on canvas"""
+        self.display_mask(mask)
+    
+    def closeEvent(self, event):
+        """Handle window close event"""
+        # Clean up resources
+        if hasattr(self, 'segy_loader'):
+            self.segy_loader.close()
+        event.accept()
     
     def _on_canvas_click(self, event):
         """Handle click events on the canvas for adding annotation points"""
@@ -258,7 +485,7 @@ class SeismicApp(ttk.Frame):
         
         # Display the slice
         vmin, vmax = np.percentile(self.current_slice, [5, 95])
-        self.ax.imshow(self.current_slice, cmap='gray', vmin=vmin, vmax=vmax, aspect='auto')
+        self.ax.imshow(self.current_slice, cmap='seismic', vmin=vmin, vmax=vmax, aspect='auto')
         
         # Get current object ID for highlighting
         current_obj_id = self.current_object_id.get()
@@ -302,9 +529,11 @@ class SeismicApp(ttk.Frame):
     
     def _open_segy_file(self):
         """Open a SEGY file dialog and load the selected file"""
-        filepath = filedialog.askopenfilename(
-            title="Open SEGY File",
-            filetypes=[("SEGY files", "*.segy *.sgy"), ("All files", "*.*")]
+        filepath, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open SEGY File",
+            "",
+            "SEGY files (*.segy *.sgy);;All files (*.*)"
         )
         
         if not filepath:
@@ -381,18 +610,20 @@ class SeismicApp(ttk.Frame):
             return
             
         # Update the slice scale limits based on data dimensions
-        if self.current_slice_type.get() == "inline":
+        if self._current_slice_type == "inline":
             max_slice = len(self.segy_loader.inlines) - 1
-        elif self.current_slice_type.get() == "crossline":
+        elif self._current_slice_type == "crossline":
             max_slice = len(self.segy_loader.crosslines) - 1
         else:  # timeslice
             max_slice = len(self.segy_loader.timeslices) - 1
             
-        self.slice_scale.configure(to=max_slice)
+        self.slice_slider.setMaximum(max_slice)
         
         # Reset index if out of bounds
-        if self.current_slice_idx.get() > max_slice:
-            self.current_slice_idx.set(0)
+        if self._current_slice_idx > max_slice:
+            self._current_slice_idx = 0
+            self.slice_slider.setValue(0)
+            self.slice_entry.setText("0")
             
         # Clear any existing annotations
         self._clear_annotations()
@@ -400,34 +631,36 @@ class SeismicApp(ttk.Frame):
         # Load the current slice
         self._load_current_slice()
     
-    def _on_slice_change(self, event=None):
+    def _on_slice_change(self, value):
         """Handle slice slider change"""
         if not hasattr(self.segy_loader, 'data') or self.segy_loader.data is None:
             return
-            
-        # Load the new slice
+        
+        self._current_slice_idx = value
+        self.slice_entry.setText(str(value))
         self._load_current_slice()
     
-    def _on_slice_entry_change(self, event=None):
+    def _on_slice_entry_change(self):
         """Handle slice entry change"""
         if not hasattr(self.segy_loader, 'data') or self.segy_loader.data is None:
             return
             
         try:
-            idx = int(self.current_slice_idx.get())
-            max_idx = self.slice_scale.cget("to")
+            idx = int(self.slice_entry.text())
+            max_idx = self.slice_slider.maximum()
             
             if idx < 0:
                 idx = 0
             elif idx > max_idx:
-                idx = int(max_idx)
+                idx = max_idx
                 
-            self.current_slice_idx.set(idx)
+            self._current_slice_idx = idx
+            self.slice_slider.setValue(idx)
             self._load_current_slice()
             
         except ValueError:
             # Reset to previous value
-            self.current_slice_idx.set(int(self.slice_scale.get()))
+            self.slice_entry.setText(str(self._current_slice_idx))
     
     def _load_current_slice(self):
         """Load and display the current slice"""
@@ -435,8 +668,8 @@ class SeismicApp(ttk.Frame):
             return
             
         # Get the current slice
-        idx = self.current_slice_idx.get()
-        slice_type = self.current_slice_type.get()
+        idx = self._current_slice_idx
+        slice_type = self._current_slice_type
         
         print(f"\nLoading {slice_type} slice {idx}")
         
@@ -495,13 +728,13 @@ class SeismicApp(ttk.Frame):
             # Add traceback for debugging
             import traceback
             trace = traceback.format_exc()
-            messagebox.showerror("Error", f"Failed to load slice: {str(e)}\n\n{trace}")
+            QMessageBox.critical(self, "Error", f"Failed to load slice: {str(e)}\n\n{trace}")
     
     def _generate_mask(self):
         """Generate mask from annotation points using SAM2"""
         points, _ = self._get_current_annotations() # Get points for current object
         if not points:
-            messagebox.showinfo("Info", "Please add at least one annotation point for the current object first.")
+            QMessageBox.information(self, "Info", "Please add at least one annotation point for the current object first.")
             return
             
         self.status_text.set(f"Generating mask for Object ID {self.current_object_id.get()}...")
@@ -558,11 +791,12 @@ class SeismicApp(ttk.Frame):
         """Propagate the mask to all slices using SAM2 video predictor"""
         points, _ = self._get_current_annotations() # Get points for current object
         if not points:
-            messagebox.showinfo("Info", "Please add at least one annotation point for the current object and generate a mask first.")
+            QMessageBox.information(self, "Info", "Please add at least one annotation point for the current object and generate a mask first.")
             return
             
         # Ask for confirmation
-        if not messagebox.askyesno("Confirm", f"This will propagate the mask for Object ID {self.current_object_id.get()} to all slices. It may take some time. Continue?"):
+        reply = QMessageBox.question(self, "Confirm", f"This will propagate the mask for Object ID {self.current_object_id.get()} to all slices. It may take some time. Continue?")
+        if reply != QMessageBox.Yes:
             return
             
         self.status_text.set(f"Preparing to propagate masks for Object ID {self.current_object_id.get()}...")
@@ -741,7 +975,7 @@ class SeismicApp(ttk.Frame):
         
         # Display the slice
         vmin, vmax = np.percentile(self.current_slice, [5, 95])
-        self.ax.imshow(self.current_slice, cmap='gray', vmin=vmin, vmax=vmax, aspect='auto')
+        self.ax.imshow(self.current_slice, cmap='seismic', vmin=vmin, vmax=vmax, aspect='auto')
         
         # Get current slice info
         slice_type = self.current_slice_type.get()
@@ -846,11 +1080,11 @@ class SeismicApp(ttk.Frame):
                 elif cmd == "progress":
                     self.progress_var.set(msg[1])
                 elif cmd == "error":
-                    messagebox.showerror("Error", msg[1])
+                    QMessageBox.critical(self, "Error", msg[1])
                     self.status_text.set("Error occurred.")
                     self.progress_var.set(0)
                 elif cmd == "update_scale":
-                    self.slice_scale.configure(to=msg[1])
+                    self.slice_slider.setMaximum(msg[1])
                     self._load_current_slice()
                 elif cmd == "display_mask":
                     self.display_mask(msg[1])
@@ -858,13 +1092,11 @@ class SeismicApp(ttk.Frame):
                 self.queue.task_done()
         except queue.Empty:
             pass
-            
-        # Schedule next queue check
-        self.master.after(100, self.process_queue)
     
     def _show_about(self):
         """Show about dialog"""
-        messagebox.showinfo(
+        QMessageBox.about(
+            self,
             "About",
             "Seismic Interpretation with SAM2\n\n"
             "An application for seismic interpretation using Segment Anything Model 2 (SAM2).\n\n"
@@ -873,7 +1105,8 @@ class SeismicApp(ttk.Frame):
     
     def _show_instructions(self):
         """Show instructions dialog"""
-        messagebox.showinfo(
+        QMessageBox.information(
+            self,
             "Instructions",
             "How to use this application:\n\n"
             "1. Load a SEGY file using File > Open SEGY.\n"
@@ -888,37 +1121,30 @@ class SeismicApp(ttk.Frame):
             "- You can use multiple object IDs to segment different features."
         )
     
-    def _on_close(self):
-        """Handle window close event"""
-        # Clean up resources
-        if hasattr(self, 'segy_loader'):
-            self.segy_loader.close()
-            
-        self.master.destroy()
 
     def _open_3d_visualization(self):
         """Open a 3D visualization window using PyVista"""
         if not hasattr(self.segy_loader, 'data') or self.segy_loader.data is None:
-            messagebox.showinfo("Info", "Please load a SEGY file first.")
+            QMessageBox.information(self, "Info", "Please load a SEGY file first.")
             return
             
         if not PYVISTA_AVAILABLE:
-            messagebox.showerror("Error", "PyVista is not available. Please install it with: pip install pyvista")
+            QMessageBox.critical(self, "Error", "PyVista is not available. Please install it with: pip install pyvista")
             return
             
         # Warn user about potential memory issues
         if np.prod(self.segy_loader.data.shape) > 100000000:  # If volume is larger than ~100M voxels
-            if not messagebox.askyesno("Warning", 
+            reply = QMessageBox.question(self, "Warning", 
                                       "The seismic volume is very large and may cause memory issues. "
-                                      "Continue with visualization?"):
+                                      "Continue with visualization?")
+            if reply != QMessageBox.Yes:
                 return
         
         # Ask how many slices to visualize
         try:
-            from tkinter.simpledialog import askinteger
-            num_slices = askinteger("Input", "Enter number of slices to visualize (5-100):", 
-                                   initialvalue=20, minvalue=5, maxvalue=100)
-            if num_slices is None:  # User canceled
+            num_slices, ok = QInputDialog.getInt(self, "Input", "Enter number of slices to visualize (5-100):", 
+                                               20, 5, 100)
+            if not ok:  # User canceled
                 num_slices = 20  # Default
         except:
             num_slices = 20  # Default if dialog fails
@@ -967,9 +1193,10 @@ class SeismicApp(ttk.Frame):
             
             # If less than 70% of sampled slices have masks, offer to propagate
             if mask_count < 0.7 * len(sample_indices):
-                if messagebox.askyesno("Propagation Needed", 
+                reply = QMessageBox.question(self, "Propagation Needed", 
                                      "Masks have not been fully propagated to all slices. "
-                                     "Propagate masks for Object {obj_id} before visualization? (Recommended)"):
+                                     f"Propagate masks for Object {obj_id} before visualization? (Recommended)")
+                if reply == QMessageBox.Yes:
                     # Run propagation with a wider range to cover all visualization slices
                     self._propagate_all_for_visualization(num_slices, obj_id) # Pass obj_id
                     # Return early - the 3D visualization will be triggered after propagation completes
@@ -1318,9 +1545,10 @@ class SeismicApp(ttk.Frame):
             
             # Add axes for reference and finalize
             try:
-                plotter.add_axes()
-                plotter.show_grid()
-                plotter.add_legend() # Add legend to identify mask colors
+                # plotter.add_axes()  # REMOVED
+                # plotter.show_grid() # REMOVED
+                # plotter.add_legend() # REMOVED (optional, keep if you want object ID colors identified)
+                pass # Keep try/except block structure if other finalization needed later
             except:
                 pass
             
@@ -1393,11 +1621,11 @@ class SeismicApp(ttk.Frame):
     def _open_3d_surface_generation(self):
         """Open a 3D surface generation and visualization window using LoopStructural or triangulation"""
         if not hasattr(self.segy_loader, 'data') or self.segy_loader.data is None:
-            messagebox.showinfo("Info", "Please load a SEGY file first.")
+            QMessageBox.information(self, "Info", "Please load a SEGY file first.")
             return
             
         if not PYVISTA_AVAILABLE:
-            messagebox.showerror("Error", "PyVista is not available. Please install it with: pip install pyvista")
+            QMessageBox.critical(self, "Error", "PyVista is not available. Please install it with: pip install pyvista")
             return
             
         # Check if any masks exist for ANY object ID
@@ -1425,41 +1653,42 @@ class SeismicApp(ttk.Frame):
                  has_masks = True # Assume masks exist if demo state is populated
 
         if not has_masks:
-            if not messagebox.askyesno("No Masks Detected", 
+            reply = QMessageBox.question(self, "No Masks Detected", 
                                      "No masks have been generated for any object. " # Updated message
                                      "You need to create and propagate masks before generating surfaces. "
-                                     "Do you want to generate a surface anyway for the current object (might be empty)?"):
+                                     "Do you want to generate a surface anyway for the current object (might be empty)?")
+            if reply != QMessageBox.Yes:
                 return
         
         # Ask the user for the surface generation method
         use_triangulation = True
         if LOOPSTRUCTURAL_AVAILABLE:
-            if messagebox.askyesno("Surface Generation Method", 
+            reply = QMessageBox.question(self, "Surface Generation Method", 
                                "LoopStructural is available. Would you like to use it for advanced surface generation?\n\n"
                                "Yes: Use LoopStructural (better for sparse data)\n"
-                               "No: Use simple triangulation (more reliable but less smooth)"):
+                               "No: Use simple triangulation (more reliable but less smooth)")
+            if reply == QMessageBox.Yes:
                 use_triangulation = False
         
         # Ask for surface generation resolution
         try:
-            from tkinter.simpledialog import askinteger
-            num_slices = askinteger("Input", "Number of slices to sample for surface (5-100):", 
-                                   initialvalue=20, minvalue=5, maxvalue=100)
-            if num_slices is None:
+            num_slices, ok = QInputDialog.getInt(self, "Input", "Number of slices to sample for surface (5-100):", 
+                                               20, 5, 100)
+            if not ok:
                 num_slices = 20  # Default if canceled
                 
             if use_triangulation:
                 # For triangulation, ask about point reduction
-                max_points = askinteger("Input", "Maximum number of points to use (100-5000):", 
-                                      initialvalue=1000, minvalue=100, maxvalue=5000)
-                if max_points is None:
+                max_points, ok = QInputDialog.getInt(self, "Input", "Maximum number of points to use (100-5000):", 
+                                                   1000, 100, 5000)
+                if not ok:
                     max_points = 1000  # Default if canceled
                 smoothing = 0  # Not used for triangulation
             else:
                 # For LoopStructural, ask about smoothing
-                smoothing = askinteger("Input", "Surface smoothing factor (1-50):", 
-                                    initialvalue=10, minvalue=1, maxvalue=50)
-                if smoothing is None:
+                smoothing, ok = QInputDialog.getInt(self, "Input", "Surface smoothing factor (1-50):", 
+                                                  10, 1, 50)
+                if not ok:
                     smoothing = 10  # Default if canceled
                 max_points = 500  # Default for LoopStructural
         except:
@@ -1627,8 +1856,9 @@ class SeismicApp(ttk.Frame):
                      except Exception as e_ls:
                           print(f"LoopStructural failed for Object {current_obj_id}: {e_ls}")
                           # Optionally try triangulation as fallback even if LoopStructural exists but failed
-                          if messagebox.askyesno("LoopStructural Failed", 
-                                                f"LoopStructural surface generation failed for Object {current_obj_id}. Try triangulation instead?"):
+                          reply = QMessageBox.question(self, "LoopStructural Failed", 
+                                                f"LoopStructural surface generation failed for Object {current_obj_id}. Try triangulation instead?")
+                          if reply == QMessageBox.Yes:
                               try:
                                   self._create_triangulation_surface(subset_points, plotter, obj_color)
                                   surface_generated = True
@@ -1644,9 +1874,9 @@ class SeismicApp(ttk.Frame):
 
 
             # --- Finalize plotter AFTER the loop ---
-            plotter.add_axes()
-            plotter.show_grid()
-            plotter.add_legend() # Add legend
+            # plotter.add_axes() # REMOVED
+            # plotter.show_grid() # REMOVED
+            # plotter.add_legend() # REMOVED (optional, keep if you want object ID colors identified)
             
             # Show the plotter
             self.queue.put(("status", "Displaying 3D surfaces..."))
@@ -2060,12 +2290,340 @@ class SeismicApp(ttk.Frame):
             self.object_annotations[obj_id] = {'points': [], 'labels': []}
         return self.object_annotations[obj_id]['points'], self.object_annotations[obj_id]['labels']
 
-    def _on_object_id_change(self, event=None):
+    def _on_object_id_change(self, value=None):
         """Handle change in object ID."""
+        if value is not None:
+            self._current_object_id = value
         print(f"Object ID changed to: {self.current_object_id.get()}")
         # Reload the current slice view to show annotations for the new object ID
         self._load_current_slice()
 
+    def _prompt_and_save_3d_view(self):
+        """Prompt user for filename and format, then save the 3D view."""
+        if not hasattr(self.segy_loader, 'data') or self.segy_loader.data is None:
+            QMessageBox.information(self, "Info", "Please load a SEGY file first.")
+            return
+        if not PYVISTA_AVAILABLE:
+            QMessageBox.critical(self, "Error", "PyVista is not available.")
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save 3D View As...",
+            "",
+            "PNG Image (*.png);;SVG Image (Experimental) (*.svg);;All Files (*.*)"
+        )
+
+        if not save_path:
+            return # User cancelled
+
+        file_ext = os.path.splitext(save_path)[1].lower()
+        save_format = "svg" if file_ext == ".svg" else "png"
+        
+        # Get the number of slices used in the last interactive view (or default)
+        # For simplicity, we'll just use a default here. Could store last used value if needed.
+        num_slices = 20 
+
+        self.status_text.set(f"Saving 3D view to {os.path.basename(save_path)}...")
+        self.progress_var.set(10)
+        
+        # Start saving in a thread
+        threading.Thread(target=self._save_3d_view_thread, 
+                         args=(save_path, save_format, num_slices), 
+                         daemon=True).start()
+
+    def _prompt_and_save_3d_surface(self):
+        """Prompt user for filename and format, then save the 3D surface."""
+        if not hasattr(self.segy_loader, 'data') or self.segy_loader.data is None:
+            QMessageBox.information(self, "Info", "Please load a SEGY file first.")
+            return
+        if not PYVISTA_AVAILABLE:
+            QMessageBox.critical(self, "Error", "PyVista is not available.")
+            return
+            
+        # Check if any masks exist (reuse logic from _open_3d_surface_generation)
+        has_masks = False
+        if hasattr(self.predictor, 'has_masks_for_object') and callable(self.predictor.has_masks_for_object):
+            all_known_obj_ids = set(self.object_annotations.keys())
+            if not self.predictor.demo_mode: all_known_obj_ids.update(self.predictor.inference_state.keys())
+            else: all_known_obj_ids.update(self.predictor.demo_state.keys())
+            for obj_id_check in all_known_obj_ids:
+                if self.predictor.has_masks_for_object(obj_id_check): has_masks = True; break
+        if not has_masks:
+             reply = QMessageBox.question(self, "No Masks", "No masks found to generate surfaces. Save an empty plot?")
+             if reply != QMessageBox.Yes:
+                 return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save 3D Surface As...",
+            "",
+            "PNG Image (*.png);;SVG Image (Experimental) (*.svg);;All Files (*.*)"
+        )
+
+        if not save_path:
+            return # User cancelled
+
+        file_ext = os.path.splitext(save_path)[1].lower()
+        save_format = "svg" if file_ext == ".svg" else "png"
+
+        # Use default parameters for surface generation for saving
+        # Could potentially ask the user again or store last used values
+        num_slices = 20
+        smoothing = 10
+        use_triangulation = not LOOPSTRUCTURAL_AVAILABLE # Default to triangulation if LS not available
+        max_points = 1000
+
+        self.status_text.set(f"Saving 3D surface to {os.path.basename(save_path)}...")
+        self.progress_var.set(10)
+
+        # Start saving in a thread
+        threading.Thread(target=self._save_3d_surface_thread, 
+                         args=(save_path, save_format, num_slices, smoothing, use_triangulation, max_points), 
+                         daemon=True).start()
+
+    # --- Add Thread Methods for Saving ---
+    def _save_3d_view_thread(self, save_path, save_format, num_slices):
+        """Generates the 3D view off-screen and saves it."""
+        try:
+            self.queue.put(("status", f"Generating 3D view for saving ({save_format})..."))
+            self.queue.put(("progress", 30))
+            
+            # --- Replicate the core logic of _create_3d_visualization ---
+            seismic_volume = self.segy_loader.data
+            ni, nj, nk = seismic_volume.shape
+            slice_type = self.current_slice_type.get()
+            
+            # Initialize OFF-SCREEN plotter
+            plotter = pv.Plotter(off_screen=True, window_size=[1200, 800]) # Use a fixed size for consistency
+            plotter.set_background("white")
+            
+            ds_i = max(1, ni // 150); ds_j = max(1, nj // 150); ds_k = max(1, nk // 150)
+            
+            if slice_type == "inline": indices = np.linspace(0, ni-1, num_slices, dtype=int)
+            elif slice_type == "crossline": indices = np.linspace(0, nj-1, num_slices, dtype=int)
+            else: indices = np.linspace(0, nk-1, num_slices, dtype=int)
+                
+            all_known_obj_ids = set(self.object_annotations.keys())
+            if self.predictor:
+                if not self.predictor.demo_mode: all_known_obj_ids.update(self.predictor.inference_state.keys())
+                else: all_known_obj_ids.update(self.predictor.demo_state.keys())
+            colors = plt.get_cmap('tab10').colors
+
+            # --- Loop to add slices and masks (Simplified from _create_3d_visualization) ---
+            for i, idx in enumerate(indices):
+                 self.queue.put(("progress", 30 + int(60 * i / num_slices)))
+                 # Add seismic slice data (copy relevant parts from _create_3d_visualization)
+                 slice_data = None; grid = None
+                 # ... [Logic to get slice_data and points/grid for the slice type] ...
+                 if slice_type == "inline":
+                      slice_data = seismic_volume[idx, ::ds_j, ::ds_k]; s_nj, s_nk = slice_data.shape
+                      x_coords = np.ones(s_nj * s_nk) * idx; y_coords = np.repeat(np.arange(0, s_nj * ds_j, ds_j), s_nk); z_coords = np.tile(np.arange(0, s_nk * ds_k, ds_k), s_nj) / 8
+                      points = np.column_stack((x_coords, y_coords, z_coords)); grid = pv.PolyData(points)
+                 elif slice_type == "crossline":
+                      slice_data = seismic_volume[::ds_i, idx, ::ds_k]; s_ni, s_nk = slice_data.shape
+                      x_coords = np.repeat(np.arange(0, s_ni * ds_i, ds_i), s_nk); y_coords = np.ones(s_ni * s_nk) * idx; z_coords = np.tile(np.arange(0, s_nk * ds_k, ds_k), s_ni) / 8
+                      points = np.column_stack((x_coords, y_coords, z_coords)); grid = pv.PolyData(points)
+                 else: # timeslice
+                      slice_data = seismic_volume[::ds_i, ::ds_j, idx]; s_ni, s_nj = slice_data.shape
+                      x_coords = np.repeat(np.arange(0, s_ni * ds_i, ds_i), s_nj); y_coords = np.tile(np.arange(0, s_nj * ds_j, ds_j), s_ni); z_coords = np.ones(s_ni * s_nj) * idx / 8
+                      points = np.column_stack((x_coords, y_coords, z_coords)); grid = pv.PolyData(points)
+
+                 if grid is not None and slice_data is not None:
+                     vmin, vmax = np.percentile(slice_data, [5, 95]); norm_data = np.clip(slice_data, vmin, vmax)
+                     norm_data = (norm_data - vmin) / (vmax - vmin) if (vmax - vmin) > 1e-6 else np.zeros_like(slice_data)
+                     grid.point_data["intensity"] = norm_data.flatten()
+                     plotter.add_mesh(grid, cmap="seismic", point_size=3, render_points_as_spheres=True, scalars="intensity")
+
+                 # Add masks for all objects (copy relevant parts from _create_3d_visualization)
+                 for current_obj_id_to_display in all_known_obj_ids:
+                     try:
+                         mask = self.predictor.get_mask_for_frame(idx, current_obj_id_to_display) 
+                         if mask is not None and np.any(mask):
+                             obj_color = colors[ (current_obj_id_to_display - 1) % len(colors) ]
+                             mask_points = []
+                             # ... [Logic to get mask_points based on slice type, identical to _create_3d_visualization] ...
+                             if slice_type == "inline":
+                                 mask_t = mask.T
+                                 if mask_t.shape[0] > 1 and mask_t.shape[1] > 1:
+                                     mask_ds = mask_t[::ds_j, ::ds_k]
+                                     if mask_ds.shape == slice_data.shape:
+                                         s_nj, s_nk = slice_data.shape # Get dimensions again here
+                                         for j in range(s_nj):
+                                             for k in range(s_nk):
+                                                 if mask_ds[j, k]: mask_points.append([idx, j*ds_j, k*ds_k/8])
+                             elif slice_type == "crossline":
+                                 mask_t = mask.T
+                                 if mask_t.shape[0] > 1 and mask_t.shape[1] > 1:
+                                     mask_ds = mask_t[::ds_i, ::ds_k]
+                                     if mask_ds.shape == slice_data.shape:
+                                         s_ni, s_nk = slice_data.shape # Get dimensions again here
+                                         for i_ in range(s_ni):
+                                             for k in range(s_nk):
+                                                 if mask_ds[i_, k]: mask_points.append([i_*ds_i, idx, k*ds_k/8])
+                             else: # timeslice
+                                 if mask.shape[0] > 1 and mask.shape[1] > 1:
+                                     mask_ds = mask[::ds_i, ::ds_j]
+                                     if mask_ds.shape == slice_data.shape:
+                                         s_ni, s_nj = slice_data.shape # Get dimensions again here
+                                         for i_ in range(s_ni):
+                                             for j in range(s_nj):
+                                                 if mask_ds[i_, j]: mask_points.append([i_*ds_i, j*ds_j, idx/8])
+
+                             if mask_points:
+                                 mask_poly = pv.PolyData(np.array(mask_points))
+                                 plotter.add_mesh(mask_poly, color=obj_color, point_size=5, render_points_as_spheres=True) 
+                     except Exception as mask_err:
+                         print(f"Error processing mask for Object {current_obj_id_to_display} on slice {idx} during save: {mask_err}")
+                         
+            # --- Save the plot ---
+            self.queue.put(("status", f"Saving plot to {os.path.basename(save_path)}..."))
+            self.queue.put(("progress", 95))
+            
+            if save_format == "png":
+                 plotter.screenshot(save_path)
+            elif save_format == "svg":
+                 try:
+                     # SVG export might be limited for complex scenes
+                     plotter.save_graphic(save_path)
+                     print("Note: SVG export quality may vary depending on scene complexity.")
+                 except Exception as svg_err:
+                      self.queue.put(("error", f"Failed to save as SVG: {svg_err}. Try PNG instead."))
+                      self.queue.put(("progress", 0))
+                      plotter.close() # Close plotter to free resources
+                      return
+            
+            plotter.close() # Close plotter to free resources
+            self.queue.put(("status", f"3D View saved successfully to {os.path.basename(save_path)}."))
+            self.queue.put(("progress", 100))
+
+        except Exception as e:
+            import traceback
+            trace = traceback.format_exc()
+            self.queue.put(("error", f"Error saving 3D view: {str(e)}\n\n{trace}"))
+            self.queue.put(("progress", 0))
+            if 'plotter' in locals() and plotter: plotter.close()
+
+    def _save_3d_surface_thread(self, save_path, save_format, num_slices, smoothing, use_triangulation, max_points):
+        """Generates the 3D surface(s) off-screen and saves it."""
+        try:
+            self.queue.put(("status", f"Generating 3D surface(s) for saving ({save_format})..."))
+            self.queue.put(("progress", 20))
+
+            # --- Replicate the core logic of _generate_3d_surface ---
+            all_known_obj_ids = set(self.object_annotations.keys())
+            if self.predictor:
+                if not self.predictor.demo_mode: all_known_obj_ids.update(self.predictor.inference_state.keys())
+                else: all_known_obj_ids.update(self.predictor.demo_state.keys())
+            
+            if not all_known_obj_ids: self.queue.put(("status", "No objects found for surface saving.")); return
+
+            seismic_volume = self.segy_loader.data
+            ni, nj, nk = seismic_volume.shape
+            slice_type = self.current_slice_type.get()
+            
+            if slice_type == "inline": indices = np.linspace(0, ni-1, num_slices, dtype=int)
+            elif slice_type == "crossline": indices = np.linspace(0, nj-1, num_slices, dtype=int)
+            else: indices = np.linspace(0, nk-1, num_slices, dtype=int)
+            
+            # Initialize OFF-SCREEN plotter
+            plotter = pv.Plotter(off_screen=True, window_size=[1200, 800])
+            plotter.set_background("white")
+            
+            # Add seismic slices (call helper, which adds to plotter)
+            self._add_seismic_slices_to_plot(plotter, slice_type, seismic_volume, indices)
+            
+            colors = plt.get_cmap('tab10').colors
+            total_progress_steps = len(all_known_obj_ids)
+            current_progress = 20
+
+            # Loop through objects (Simplified from _generate_3d_surface)
+            for i, current_obj_id in enumerate(sorted(list(all_known_obj_ids))):
+                 obj_progress_start = current_progress
+                 obj_progress_share = (90 - 20) / total_progress_steps
+                 self.queue.put(("status", f"Processing Object {current_obj_id} for save..."))
+                 self.queue.put(("progress", obj_progress_start))
+
+                 # Collect points (copy relevant parts from _generate_3d_surface)
+                 all_points_for_obj = []
+                 # ... [Logic to get mask and append points to all_points_for_obj, identical to _generate_3d_surface] ...
+                 for j, idx in enumerate(indices):
+                     progress_within_obj = int( (obj_progress_share * 0.5) * (j / len(indices)) )
+                     self.queue.put(("progress", obj_progress_start + progress_within_obj))
+                     try:
+                         mask = self.predictor.get_mask_for_frame(idx, current_obj_id) 
+                         if mask is not None and np.any(mask):
+                             if slice_type == "inline":
+                                 mask_t = mask.T; ys, zs = np.where(mask_t)
+                                 for y, z in zip(ys, zs): all_points_for_obj.append([idx, y, z/8])
+                             elif slice_type == "crossline":
+                                 mask_t = mask.T; xs, zs = np.where(mask_t)
+                                 for x, z in zip(xs, zs): all_points_for_obj.append([x, idx, z/8])
+                             else:
+                                 xs, ys = np.where(mask)
+                                 for x, y in zip(xs, ys): all_points_for_obj.append([x, y, idx/8])
+                     except Exception as e:
+                         print(f"Error processing mask frame {idx}, Obj {current_obj_id} during save: {e}")
+
+                 if len(all_points_for_obj) < 10: continue # Skip object if no points
+                 
+                 current_progress = obj_progress_start + (obj_progress_share * 0.5)
+                 self.queue.put(("progress", current_progress )) 
+
+                 points_array_for_obj = np.array(all_points_for_obj)
+                 obj_color = colors[ (current_obj_id - 1) % len(colors) ]
+                 
+                 # Add points cloud
+                 # point_cloud = pv.PolyData(points_array_for_obj) # Optionally add points
+                 # plotter.add_mesh(point_cloud, color=obj_color, point_size=3, render_points_as_spheres=True)
+
+                 # Thin points
+                 if len(points_array_for_obj) > max_points:
+                     indices_subset = np.random.choice(len(points_array_for_obj), max_points, replace=False)
+                     subset_points = points_array_for_obj[indices_subset]
+                 else: subset_points = points_array_for_obj
+
+                 # Generate surface (call helpers, which add to plotter)
+                 try:
+                     if use_triangulation:
+                         self._create_triangulation_surface(subset_points, plotter, obj_color)
+                     else:
+                         self._create_loopstructural_surface(subset_points, plotter, smoothing, ni, nj, nk, obj_color)
+                 except Exception as surface_err:
+                      print(f"Could not generate surface for Object {current_obj_id} during save: {surface_err}")
+                      # Optionally add fallback here if needed
+
+                 current_progress += (obj_progress_share * 0.5)
+                 self.queue.put(("progress", current_progress ))
+            
+            # --- Save the plot ---
+            self.queue.put(("status", f"Saving plot to {os.path.basename(save_path)}..."))
+            self.queue.put(("progress", 95))
+
+            if save_format == "png":
+                 plotter.screenshot(save_path)
+            elif save_format == "svg":
+                 try:
+                     # SVG export might be limited
+                     plotter.save_graphic(save_path)
+                     print("Note: SVG export quality may vary depending on scene complexity.")
+                 except Exception as svg_err:
+                      self.queue.put(("error", f"Failed to save as SVG: {svg_err}. Try PNG instead."))
+                      self.queue.put(("progress", 0))
+                      plotter.close()
+                      return
+
+            plotter.close() # Close plotter to free resources
+            self.queue.put(("status", f"3D Surface saved successfully to {os.path.basename(save_path)}."))
+            self.queue.put(("progress", 100))
+
+        except Exception as e:
+            import traceback
+            trace = traceback.format_exc()
+            self.queue.put(("error", f"Error saving 3D surface: {str(e)}\n\n{trace}"))
+            self.queue.put(("progress", 0))
+            if 'plotter' in locals() and plotter: plotter.close()
+            
 
 def main():
     # Parse command line arguments
@@ -2086,13 +2644,42 @@ def main():
     else:
         print(f"Starting with SAM2 model: {model_id}")
     
-    root = tk.Tk()
-    root.geometry("1200x800")  # Set initial window size
+    # Set Qt application attributes before creating QApplication (skip deprecated ones for Qt6)
+    # QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)  # Deprecated in Qt6
+    # QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)     # Deprecated in Qt6
     
-    # Create the app with the specified model_id
-    app = SeismicApp(root, demo_mode=demo_mode, model_id=model_id)
-    
-    root.mainloop()
+    try:
+        # Create QApplication
+        app = QApplication(sys.argv)
+        
+        # Set application properties
+        app.setApplicationName("Seismic Interpretation App")
+        app.setApplicationVersion("1.0")
+        app.setOrganizationName("Seismic Analysis")
+        
+        # Create the main window
+        window = SeismicApp(demo_mode=demo_mode, model_id=model_id)
+        window.show()
+        
+        # Start the event loop
+        sys.exit(app.exec())
+        
+    except Exception as e:
+        print(f"Error starting application: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Fallback: try without high DPI scaling
+        try:
+            print("Trying without high DPI scaling...")
+            app = QApplication(sys.argv)
+            window = SeismicApp(demo_mode=demo_mode, model_id=model_id)
+            window.show()
+            sys.exit(app.exec())
+        except Exception as e2:
+            print(f"Fallback also failed: {e2}")
+            traceback.print_exc()
+            return 1
 
 if __name__ == "__main__":
     main()

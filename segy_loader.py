@@ -84,7 +84,7 @@ class SegyLoader:
         # For timeslice, the orientation is different
         return self.data[:, :, time_idx]
     
-    def create_figure(self, slice_data, vmin=None, vmax=None, cmap='gray'):
+    def create_figure(self, slice_data, vmin=None, vmax=None, cmap='seismic_r'):
         """Create a matplotlib figure from slice data"""
         # No need to transpose or rotate inline/crossline slices as they're already properly oriented
         # Just add rotation if needed for specific slice types
@@ -99,7 +99,7 @@ class SegyLoader:
         ax = fig.add_subplot(111)
         
         # Display with standard orientation
-        im = ax.imshow(slice_data, cmap='gray', vmin=vmin, vmax=vmax, aspect='auto')
+        im = ax.imshow(slice_data, cmap='seismic', vmin=vmin, vmax=vmax, aspect='auto')
         
         # Set proper axis labels
         ax.set_xlabel('Trace Position')

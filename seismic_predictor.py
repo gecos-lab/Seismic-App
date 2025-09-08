@@ -1032,7 +1032,7 @@ class SeismicPredictor:
         ax = fig.add_subplot(111)
         
         # Display slice with 'gray' colormap for better contrast
-        ax.imshow(slice_data, cmap='gray', vmin=vmin, vmax=vmax, aspect='auto')
+        ax.imshow(slice_data, cmap='seismic', vmin=vmin, vmax=vmax, aspect='auto')
         
         # Create mask overlay
         mask_overlay = np.zeros((*mask.shape, 4))
