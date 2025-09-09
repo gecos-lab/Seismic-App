@@ -113,6 +113,12 @@ class SeismicApp(QMainWindow):
         self.dp_lambda = 1.0               # smoothness strength
         self.horizon_min_conf = 0.35       # confidence gate
         self.snap_kernel = 7               # moving-average kernel for ridge-aware snapping
+        self.use_dip_band = True           # enable dip-steered band by default
+        self.dip_sigma = 1.5               # structure tensor smoothing
+        self.band_half_width = 12          # half-width around dip centerline
+        self.max_slope = 1.0               # max |dy/dx| per column step
+        self.show_masks_enabled = True     # show segmentation masks
+        self.mask_alpha = 0.35             # global mask opacity multiplier (0..1)
         
         # Initialize point collection per object ID
         self.object_annotations = {} # Stores {'points': [], 'labels': []} for each object ID
@@ -287,6 +293,12 @@ class SeismicApp(QMainWindow):
         instructions_action = QAction("Instructions", self)
         instructions_action.triggered.connect(self._show_instructions)
         help_menu.addAction(instructions_action)
+
+        # Tools menu
+        tools_menu = menubar.addMenu("Tools")
+        synth_action = QAction("Generate Synthetic Volume", self)
+        synth_action.triggered.connect(self._generate_synthetic_volume)
+        tools_menu.addAction(synth_action)
     
     def _set_slice_type(self, slice_type):
         """Handle slice type change from menu"""
@@ -401,6 +413,20 @@ class SeismicApp(QMainWindow):
         self.show_horizon_checkbox.toggled.connect(self._on_show_horizon_changed)
         horizon_layout.addWidget(self.show_horizon_checkbox)
 
+        # Mask visibility/opacity controls
+        self.show_masks_checkbox = QCheckBox("Show Mask")
+        self.show_masks_checkbox.setChecked(self.show_masks_enabled)
+        self.show_masks_checkbox.toggled.connect(self._on_show_masks_changed)
+        horizon_layout.addWidget(self.show_masks_checkbox)
+
+        horizon_layout.addWidget(QLabel("Mask α:"))
+        self.mask_alpha_spin = QDoubleSpinBox()
+        self.mask_alpha_spin.setRange(0.0, 1.0)
+        self.mask_alpha_spin.setSingleStep(0.05)
+        self.mask_alpha_spin.setValue(self.mask_alpha)
+        self.mask_alpha_spin.valueChanged.connect(self._on_mask_alpha_changed)
+        horizon_layout.addWidget(self.mask_alpha_spin)
+
         horizon_layout.addWidget(QLabel("Mode:"))
         self.snap_mode_combo = QComboBox()
         self.snap_mode_combo.addItems(["Peak", "Trough", "Zero"])
@@ -445,6 +471,35 @@ class SeismicApp(QMainWindow):
         self.snap_kernel_spin.setValue(self.snap_kernel)
         self.snap_kernel_spin.valueChanged.connect(self._on_snap_kernel_changed)
         horizon_layout.addWidget(self.snap_kernel_spin)
+
+        # Dip-steer controls
+        self.dip_band_checkbox = QCheckBox("Dip-Steer")
+        self.dip_band_checkbox.setChecked(self.use_dip_band)
+        self.dip_band_checkbox.toggled.connect(self._on_dip_band_changed)
+        horizon_layout.addWidget(self.dip_band_checkbox)
+
+        horizon_layout.addWidget(QLabel("Sigma:"))
+        self.dip_sigma_spin = QDoubleSpinBox()
+        self.dip_sigma_spin.setRange(0.5, 5.0)
+        self.dip_sigma_spin.setSingleStep(0.1)
+        self.dip_sigma_spin.setValue(self.dip_sigma)
+        self.dip_sigma_spin.valueChanged.connect(self._on_dip_sigma_changed)
+        horizon_layout.addWidget(self.dip_sigma_spin)
+
+        horizon_layout.addWidget(QLabel("Band W:"))
+        self.band_width_spin = QSpinBox()
+        self.band_width_spin.setRange(3, 50)
+        self.band_width_spin.setValue(self.band_half_width)
+        self.band_width_spin.valueChanged.connect(self._on_band_width_changed)
+        horizon_layout.addWidget(self.band_width_spin)
+
+        horizon_layout.addWidget(QLabel("MaxSlope:"))
+        self.max_slope_spin = QDoubleSpinBox()
+        self.max_slope_spin.setRange(0.2, 5.0)
+        self.max_slope_spin.setSingleStep(0.1)
+        self.max_slope_spin.setValue(self.max_slope)
+        self.max_slope_spin.valueChanged.connect(self._on_max_slope_changed)
+        horizon_layout.addWidget(self.max_slope_spin)
 
         self.main_layout.addWidget(horizon_group)
 
@@ -534,6 +589,30 @@ class SeismicApp(QMainWindow):
         self.snap_kernel = v
         if self.snap_kernel_spin.value() != v:
             self.snap_kernel_spin.setValue(v)
+        self._load_current_slice()
+
+    def _on_dip_band_changed(self, checked):
+        self.use_dip_band = bool(checked)
+        self._load_current_slice()
+
+    def _on_dip_sigma_changed(self, value):
+        self.dip_sigma = float(value)
+        self._load_current_slice()
+
+    def _on_band_width_changed(self, value):
+        self.band_half_width = int(value)
+        self._load_current_slice()
+
+    def _on_max_slope_changed(self, value):
+        self.max_slope = float(value)
+        self._load_current_slice()
+
+    def _on_show_masks_changed(self, checked):
+        self.show_masks_enabled = bool(checked)
+        self._load_current_slice()
+
+    def _on_mask_alpha_changed(self, value):
+        self.mask_alpha = float(value)
         self._load_current_slice()
     
     def _update_status(self, text):
@@ -662,7 +741,11 @@ class SeismicApp(QMainWindow):
                         snap_window=self.snap_window,
                         dp_window=self.dp_window,
                         dp_lambda=self.dp_lambda,
-                        snap_kernel=self.snap_kernel
+                        snap_kernel=self.snap_kernel,
+                        use_dip_band=self.use_dip_band,
+                        dip_sigma=self.dip_sigma,
+                        band_half_width=self.band_half_width,
+                        max_slope=self.max_slope
                     )
                     if result is not None:
                         x_h, y_h, conf = result
@@ -1180,14 +1263,15 @@ class SeismicApp(QMainWindow):
                      print(f"Could not fetch mask for Object {obj_id} on frame {frame_pos}: {e}")
 
             # If we have a mask for this object ID, display it
-            if mask_to_display is not None:
+            if mask_to_display is not None and self.show_masks_enabled:
                  if mask_to_display.shape != self.current_slice.shape:
                      print(f"Warning: Mask shape {mask_to_display.shape} mismatch for Object {obj_id} on slice {self.current_slice.shape}. Skipping.")
                      continue # Skip overlay if shapes don't match
 
                  mask_overlay = np.zeros((*mask_to_display.shape, 4))
                  obj_color = colors[ (obj_id - 1) % len(colors) ]
-                 alpha = 0.6 if is_current else 0.4 # Current slightly more opaque
+                 base_alpha = 0.6 if is_current else 0.4 # Current slightly more opaque
+                 alpha = float(np.clip(base_alpha * self.mask_alpha, 0.0, 1.0))
                  
                  mask_overlay[mask_to_display > 0] = [*obj_color, alpha]
                  self.ax.imshow(mask_overlay, aspect='auto')
@@ -1249,7 +1333,11 @@ class SeismicApp(QMainWindow):
                         snap_window=self.snap_window,
                         dp_window=self.dp_window,
                         dp_lambda=self.dp_lambda,
-                        snap_kernel=self.snap_kernel
+                        snap_kernel=self.snap_kernel,
+                        use_dip_band=self.use_dip_band,
+                        dip_sigma=self.dip_sigma,
+                        band_half_width=self.band_half_width,
+                        max_slope=self.max_slope
                     )
                     if result is not None:
                         x_h, y_h, conf = result
@@ -1321,6 +1409,50 @@ class SeismicApp(QMainWindow):
             "- Blue points indicate background (areas to exclude).\n"
             "- You can use multiple object IDs to segment different features."
         )
+    
+    def _generate_synthetic_volume(self):
+        """Generate a clean synthetic seismic volume for testing."""
+        try:
+            # Ask basic parameters
+            ni, ok1 = QInputDialog.getInt(self, "Synthetic Volume", "Inlines (40-200):", 80, 40, 400)
+            if not ok1: return
+            nj, ok2 = QInputDialog.getInt(self, "Synthetic Volume", "Crosslines (100-500):", 200, 50, 1000)
+            if not ok2: return
+            nt, ok3 = QInputDialog.getInt(self, "Synthetic Volume", "Samples (400-1500):", 800, 200, 4000)
+            if not ok3: return
+            freq, ok4 = QInputDialog.getDouble(self, "Synthetic Volume", "Wavelet Freq (Hz):", 25.0, 5.0, 80.0, 1)
+            if not ok4: return
+            snr, ok5 = QInputDialog.getDouble(self, "Synthetic Volume", "SNR (dB):", 30.0, 0.0, 60.0, 1)
+            if not ok5: return
+
+            self.status_text.set("Generating synthetic volume...")
+            self.progress_var.set(10)
+            
+            def worker():
+                try:
+                    ok = self.segy_loader.generate_synthetic(ni=ni, nj=nj, nt=nt, freq=freq, snr_db=snr)
+                    if not ok:
+                        self.queue.put(("error", "Failed to generate synthetic volume"))
+                        return
+                    # Inform predictor
+                    self.predictor.set_seismic_volume(self.segy_loader)
+                    # Update scale for current slice type
+                    if self.current_slice_type.get() == "inline":
+                        max_slice = len(self.segy_loader.inlines) - 1
+                    elif self.current_slice_type.get() == "crossline":
+                        max_slice = len(self.segy_loader.crosslines) - 1
+                    else:
+                        max_slice = len(self.segy_loader.timeslices) - 1
+                    self.queue.put(("update_scale", max_slice))
+                    self.queue.put(("status", "Synthetic volume generated"))
+                    self.queue.put(("progress", 100))
+                except Exception as e:
+                    self.queue.put(("error", f"Error generating synthetic: {e}"))
+                    self.queue.put(("progress", 0))
+
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Synthetic generation failed: {e}")
     
 
     def _open_3d_visualization(self):

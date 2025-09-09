@@ -522,6 +522,38 @@ class SeismicPredictor:
         if obj_id not in current_state["object_ids"]:
              current_state["object_ids"].append(obj_id)
              
+        # Augment prompts with a thin horizon band derived from previous refined path if available
+        try:
+            slice_type = self.current_slice_type
+            # Try current refined horizon for this frame
+            slice_key = f"{slice_type}_{frame_idx}"
+            if obj_id in self.horizon_paths and slice_key in self.horizon_paths[obj_id]:
+                path = self.horizon_paths[obj_id][slice_key]
+                xh, yh = path.get("x"), path.get("y")
+                if xh is not None and yh is not None:
+                    h, w = self.current_slice.shape if self.current_slice is not None else (None, None)
+                    if h is None or w is None:
+                        # fallback from seismic_volume
+                        if slice_type == "inline":
+                            h, w = self.seismic_volume.get_inline_slice(0).shape
+                        elif slice_type == "crossline":
+                            h, w = self.seismic_volume.get_crossline_slice(0).shape
+                        else:
+                            h, w = self.seismic_volume.get_timeslice(0).shape
+                    band_mask = self._horizon_line_to_mask(h, w, xh, yh, half_width=3)
+                    # Convert band mask to sparse foreground/background points
+                    ys, xs = np.where(band_mask)
+                    # Subsample to ~200 pts max
+                    if ys.size > 0:
+                        take = min(200, ys.size)
+                        sel = np.linspace(0, ys.size - 1, take, dtype=int)
+                        aug_points = np.column_stack([xs[sel], ys[sel]]).tolist()
+                        aug_labels = [1] * take
+                        points = (points or []) + aug_points
+                        labels = (labels or []) + aug_labels
+        except Exception:
+            pass
+
         self.video_predictor.add_new_points(
             current_state,
             frame_idx,
@@ -532,6 +564,16 @@ class SeismicPredictor:
         )
         
         return True
+
+    def _auto_points_from_mask(self, mask, max_points=150):
+        ys, xs = np.where(mask)
+        if ys.size == 0:
+            return [], []
+        take = min(max_points, ys.size)
+        sel = np.linspace(0, ys.size - 1, take, dtype=int)
+        pts = np.column_stack([xs[sel], ys[sel]]).tolist()
+        lbl = [1] * take
+        return pts, lbl
         
     def propagate_masks(self, obj_id, start_frame_idx=None, max_frames=None, reverse=False): # Add obj_id
         """Propagate masks through the video sequence for a specific object
@@ -555,12 +597,57 @@ class SeismicPredictor:
             
         current_state = self.inference_state[obj_id]
             
+        # Preconditioning: if we have a refined horizon at start, give the band as soft prior
+        try:
+            slice_type = self.current_slice_type
+            skey = f"{slice_type}_{start_frame_idx}" if start_frame_idx is not None else None
+            if skey and obj_id in self.horizon_paths and skey in self.horizon_paths[obj_id]:
+                path = self.horizon_paths[obj_id][skey]
+                xh, yh = path.get("x"), path.get("y")
+                h, w = self.current_slice.shape if self.current_slice is not None else (None, None)
+                if h is None or w is None:
+                    if slice_type == "inline":
+                        h, w = self.seismic_volume.get_inline_slice(0).shape
+                    elif slice_type == "crossline":
+                        h, w = self.seismic_volume.get_crossline_slice(0).shape
+                    else:
+                        h, w = self.seismic_volume.get_timeslice(0).shape
+                prior_mask = self._horizon_line_to_mask(h, w, xh, yh, half_width=3)
+                # Many video predictors support external priors; if not, we add as points to start frame
+                pts, lbl = self._auto_points_from_mask(prior_mask, max_points=200)
+                if pts:
+                    try:
+                        self.video_predictor.add_new_points(current_state, start_frame_idx, obj_id,
+                                                            points=np.array(pts), labels=np.array(lbl), clear_old_points=False)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         self.video_predictor.propagate_in_video(
             current_state, # Use state for this object
             start_frame_idx=start_frame_idx,
             max_frame_num_to_track=max_frames,
             reverse=reverse
         )
+
+        # After propagation, auto-generate sparse prompts on each processed slice
+        try:
+            state = self.inference_state[obj_id]
+            processed_frames = sorted(state.get("output", {}).keys())
+            for f in processed_frames:
+                masks = state["output"][f]["mask"]
+                if masks:
+                    mask = masks[0]
+                    pts, lbl = self._auto_points_from_mask(mask, max_points=100)
+                    if pts:
+                        try:
+                            self.video_predictor.add_new_points(current_state, f, obj_id,
+                                                                points=np.array(pts), labels=np.array(lbl), clear_old_points=False)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
         
         return True
     
@@ -1099,6 +1186,136 @@ class SeismicPredictor:
         vs = np.convolve(vp, kernel, mode='valid')
         return vs
 
+    # --- Structure tensor / dip utilities ---
+    def _compute_orientation_map(self, slice_data, sigma=1.5):
+        """Compute reflector orientation (tangent angle) using structure tensor.
+
+        Returns angle theta (radians) where dy/dx ~ tan(theta)."""
+        arr = np.asarray(slice_data, dtype=float)
+        try:
+            from scipy.ndimage import gaussian_filter, sobel
+            Ix = sobel(arr, axis=1)
+            Iy = sobel(arr, axis=0)
+            J11 = gaussian_filter(Ix * Ix, sigma)
+            J22 = gaussian_filter(Iy * Iy, sigma)
+            J12 = gaussian_filter(Ix * Iy, sigma)
+        except Exception:
+            # Fallback using numpy gradients and simple smoothing
+            Ix = np.gradient(arr, axis=1)
+            Iy = np.gradient(arr, axis=0)
+            J11 = Ix * Ix
+            J22 = Iy * Iy
+            J12 = Ix * Iy
+        theta = 0.5 * np.arctan2(2.0 * J12, (J11 - J22) + 1e-6)
+        return theta
+
+    def _centerline_from_dip(self, theta, start_y, start_x, max_slope=1.0, smooth_k=7):
+        """Integrate local slope to get a predicted centerline across columns.
+
+        theta: 2D array of angles (radians), dy/dx ≈ tan(theta)
+        start_y: starting row (float)
+        start_x: starting column (int)
+        max_slope: clamp |dy/dx| per column step
+        smooth_k: moving average to stabilize the path
+        """
+        h, w = theta.shape
+        y_pred = np.full(w, np.nan, dtype=float)
+        x0 = int(np.clip(start_x, 0, w - 1))
+        y0 = float(np.clip(start_y, 0, h - 1))
+        y_pred[x0] = y0
+
+        # forward
+        for x in range(x0 + 1, w):
+            y_prev = int(np.clip(round(y_pred[x - 1]), 0, h - 1))
+            slope = np.tan(theta[y_prev, x - 1])
+            if np.isfinite(max_slope):
+                slope = float(np.clip(slope, -max_slope, max_slope))
+            y_pred[x] = float(np.clip(y_pred[x - 1] + slope, 0, h - 1))
+
+        # backward
+        for x in range(x0 - 1, -1, -1):
+            y_prev = int(np.clip(round(y_pred[x + 1]), 0, h - 1))
+            slope = np.tan(theta[y_prev, x + 1])
+            if np.isfinite(max_slope):
+                slope = float(np.clip(slope, -max_slope, max_slope))
+            y_pred[x] = float(np.clip(y_pred[x + 1] - slope, 0, h - 1))
+
+        # smooth centerline
+        y_pred = self._smooth_1d(y_pred, smooth_k)
+        return y_pred
+
+    def _recenter_centerline(self, slice_data, centerline, mode='trough', recenter_window=8):
+        """Shift a centerline vertically to the nearest reflector extrema per column.
+
+        For mode='trough' choose local minimum, for 'peak' choose local maximum,
+        for 'zero' choose near-zero with large gradient.
+        """
+        if centerline is None:
+            return None
+        h, w = slice_data.shape
+        yc = np.asarray(centerline, dtype=float).copy()
+        win = int(max(1, recenter_window))
+        for x in range(w):
+            y0 = int(np.clip(round(yc[x]), 0, h - 1))
+            y_min = max(0, y0 - win)
+            y_max = min(h - 1, y0 + win)
+            v = slice_data[y_min:y_max + 1, x]
+            if v.size == 0:
+                continue
+            if mode == 'peak':
+                j = int(np.argmax(v))
+            elif mode == 'trough':
+                j = int(np.argmin(v))
+            else:  # zero crossing preference with edge strength
+                if v.size < 3:
+                    j = int(np.argmin(np.abs(v)))
+                else:
+                    g = np.abs(np.gradient(v))
+                    s = np.abs(v) - 0.5 * (g / (np.mean(g) + 1e-6))
+                    j = int(np.argmin(s))
+            yc[x] = y_min + j
+        k = int(max(3, win if win % 2 == 1 else win + 1))
+        yc = self._smooth_1d(yc, k)
+        return yc
+
+    def _densify_seed(self, x_seed, y_seed, width, band_centerline=None):
+        """Create a dense seed path covering all x in [0, width-1].
+
+        - Interpolates between provided seed points
+        - Uses band_centerline to extrapolate outside the seed span when available
+        - Falls back to edge values (hold) if band not available
+        """
+        xs_full = np.arange(int(width), dtype=int)
+
+        # If no seed available at all, try band; otherwise flat line
+        if x_seed is None or y_seed is None or len(x_seed) == 0:
+            if band_centerline is not None:
+                y_init = np.asarray(band_centerline, dtype=float).copy()
+                # Replace non-finite with median
+                if not np.all(np.isfinite(y_init)):
+                    med = float(np.nanmedian(y_init)) if np.isfinite(np.nanmedian(y_init)) else 0.0
+                    y_init[~np.isfinite(y_init)] = med
+            else:
+                y_init = np.zeros_like(xs_full, dtype=float)
+            return xs_full, y_init
+
+        # Interpolate across all columns using the seed
+        x_seed = np.asarray(x_seed, dtype=float)
+        y_seed = np.asarray(y_seed, dtype=float)
+        y_interp = np.interp(xs_full, x_seed, y_seed)
+
+        # Extrapolate outside the seed domain using band centerline if available
+        if band_centerline is not None:
+            band = np.asarray(band_centerline, dtype=float)
+            left = xs_full < x_seed.min()
+            right = xs_full > x_seed.max()
+            if left.any():
+                y_interp[left] = band[left]
+            if right.any():
+                y_interp[right] = band[right]
+
+        return xs_full, y_interp.astype(float)
+
     def _reflector_data_score(self, v, mode, kernel_size=1):
         """Compute a per-sample data score for a vertical trace segment v.
 
@@ -1108,7 +1325,17 @@ class SeismicPredictor:
         v = np.asarray(v, dtype=float)
         eps = 1e-6
         vs = self._smooth_1d(v, kernel_size)
+        # Handle very short vectors to avoid gradient errors
+        if vs.size < 3:
+            if mode == 'peak':
+                return -vs
+            elif mode == 'trough':
+                return vs
+            else:
+                return np.abs(vs)
         g = np.gradient(vs)
+        if g.size < 3:
+            g = np.pad(g, (1, 1), mode='edge')[:vs.size]
         c = np.gradient(g)
         # Normalize signals
         a = vs / (np.mean(np.abs(vs)) + eps)
@@ -1127,7 +1354,48 @@ class SeismicPredictor:
 
         return cost
 
-    def snap_polyline_to_reflector(self, slice_data, x_coords, y_coords, mode='peak', window=8, kernel_size=7):
+    def _estimate_vertical_shift(self, prev_slice, curr_slice, max_shift=12):
+        """Estimate a global vertical shift (in samples) aligning prev->curr.
+
+        Uses simple NCC over a limited shift range.
+        """
+        try:
+            from scipy.ndimage import shift as ndi_shift
+        except Exception:
+            ndi_shift = None
+        max_shift = int(max(1, max_shift))
+        best_s = 0
+        best_score = -np.inf
+        # Normalize columns to reduce amplitude bias
+        A = prev_slice.astype(float)
+        B = curr_slice.astype(float)
+        A = (A - np.mean(A)) / (np.std(A) + 1e-6)
+        B = (B - np.mean(B)) / (np.std(B) + 1e-6)
+        for s in range(-max_shift, max_shift + 1):
+            if ndi_shift is not None:
+                As = ndi_shift(A, shift=(s, 0), order=1, mode='nearest')
+            else:
+                # crude integer shift
+                As = np.roll(A, s, axis=0)
+            score = float(np.mean(As * B))
+            if score > best_score:
+                best_score = score
+                best_s = s
+        return int(best_s)
+
+    def _horizon_line_to_mask(self, h, w, x_coords, y_coords, half_width=3):
+        mask = np.zeros((h, w), dtype=bool)
+        if x_coords is None or y_coords is None or len(x_coords) == 0:
+            return mask
+        hw = int(max(1, half_width))
+        for xi, yi in zip(np.asarray(x_coords, dtype=int), np.asarray(y_coords, dtype=float)):
+            y0 = int(round(yi))
+            y_min = max(0, y0 - hw)
+            y_max = min(h - 1, y0 + hw)
+            mask[y_min:y_max + 1, int(np.clip(xi, 0, w - 1))] = True
+        return mask
+
+    def snap_polyline_to_reflector(self, slice_data, x_coords, y_coords, mode='peak', window=8, kernel_size=7, band_centerline=None, band_half_width=None):
         """Snap an input polyline to the nearest reflector (peak/trough/zero) within a vertical window.
 
         Returns:
@@ -1143,9 +1411,30 @@ class SeismicPredictor:
         eps = 1e-6
 
         for i, x in enumerate(x_coords):
-            y0 = int(round(y_coords[i]))
-            y_min = max(0, y0 - int(window))
-            y_max = min(h - 1, y0 + int(window))
+            # center around dip band if provided; otherwise seed path
+            if band_centerline is not None and int(x) < len(band_centerline) and not np.isnan(band_centerline[int(x)]):
+                # Prefer intersection (with small margin) to avoid large search jumps
+                y0_band = int(round(band_centerline[int(x)]))
+                bw = int(band_half_width) if band_half_width is not None else int(window)
+                yb_min = max(0, y0_band - bw)
+                yb_max = min(h - 1, y0_band + bw)
+                y0_seed = int(round(y_coords[i]))
+                ys_min = max(0, y0_seed - int(window))
+                ys_max = min(h - 1, y0_seed + int(window))
+                # intersection + margin
+                margin = 2
+                y_min = max(yb_min, ys_min) - margin
+                y_max = min(yb_max, ys_max) + margin
+                y_min = max(0, y_min)
+                y_max = min(h - 1, y_max)
+                if y_max < y_min:
+                    # if disjoint, fall back to the narrower of the two windows around band
+                    y_min = yb_min
+                    y_max = yb_max
+            else:
+                y0_seed = int(round(y_coords[i]))
+                y_min = max(0, y0_seed - int(window))
+                y_max = min(h - 1, y0_seed + int(window))
             if y_max < y_min:
                 continue
             v = slice_data[y_min:y_max + 1, int(x)]
@@ -1181,7 +1470,7 @@ class SeismicPredictor:
         segments.append((start, len(x_coords)))
         return segments
 
-    def dynamic_programming_refine(self, slice_data, x_coords, y_seed, mode='peak', dp_window=8, lam_smooth=1.0, kernel_size=7):
+    def dynamic_programming_refine(self, slice_data, x_coords, y_seed, mode='peak', dp_window=8, lam_smooth=1.0, kernel_size=7, band_centerline=None, band_half_width=None):
         """Refine a horizon path with a simple dynamic programming smoother.
 
         Args:
@@ -1214,9 +1503,28 @@ class SeismicPredictor:
             cand_list = []
             cost_list = []
             for i, x in enumerate(xs):
-                y0 = int(round(ys0[i]))
-                y_min = max(0, y0 - int(dp_window))
-                y_max = min(h - 1, y0 + int(dp_window))
+                # Prefer dip-steered band if available at this x
+                if band_centerline is not None and int(x) < len(band_centerline) and not np.isnan(band_centerline[int(x)]):
+                    y0b = int(round(band_centerline[int(x)]))
+                    bw = int(band_half_width) if band_half_width is not None else int(dp_window)
+                    yb_min = max(0, y0b - bw)
+                    yb_max = min(h - 1, y0b + bw)
+                    # intersection with seed window (+/- small margin) to avoid cross-event jumps
+                    y0s = int(round(ys0[i]))
+                    ys_min = max(0, y0s - int(dp_window))
+                    ys_max = min(h - 1, y0s + int(dp_window))
+                    margin = 2
+                    y_min = max(yb_min, ys_min) - margin
+                    y_max = min(yb_max, ys_max) + margin
+                    y_min = max(0, y_min)
+                    y_max = min(h - 1, y_max)
+                    if y_max < y_min:
+                        y_min = yb_min
+                        y_max = yb_max
+                else:
+                    y0 = int(round(ys0[i]))
+                    y_min = max(0, y0 - int(dp_window))
+                    y_max = min(h - 1, y0 + int(dp_window))
                 if y_max < y_min:
                     # Fallback to current y
                     y_min = y0
@@ -1227,7 +1535,7 @@ class SeismicPredictor:
                 cand_list.append(cand_y)
                 cost_list.append(data_cost)
 
-            # DP tables
+            # DP tables (increase smoothness slightly to reduce flicker)
             # Initialize with first column
             J0 = cost_list[0]
             prev_cost = np.array(J0, dtype=float)
@@ -1243,7 +1551,7 @@ class SeismicPredictor:
 
                 for j, yc in enumerate(y_curr):
                     # Smoothness term relative to all previous candidates
-                    smooth = lam_smooth * np.abs(y_prev - yc)
+                    smooth = (lam_smooth * 1.5) * np.abs(y_prev - yc)
                     c = prev_cost + smooth
                     k = int(np.argmin(c))
                     new_cost[j] = float(c[k]) + float(data_cost[j])
@@ -1265,15 +1573,19 @@ class SeismicPredictor:
         return y_out
 
     def refine_horizon(self, obj_id, slice_type, slice_idx, slice_data, seed_mask=None, prev_path=None,
-                       mode='peak', snap_window=8, dp_window=8, dp_lambda=1.0, snap_kernel=7):
+                       mode='peak', snap_window=8, dp_window=8, dp_lambda=1.0, snap_kernel=7,
+                       use_dip_band=False, dip_sigma=1.5, band_half_width=12, max_slope=1.0):
         """Refine a horizon from a seed (mask or previous path), snap to reflector, and smooth.
 
         Stores the result internally and returns (x, y, confidence).
         """
         # Decide seed polyline
         x_seed, y_seed = (None, None)
+        seed_from_mask = False
         if seed_mask is not None:
             x_seed, y_seed = self.mask_to_polyline(seed_mask)
+            if x_seed is not None and y_seed is not None:
+                seed_from_mask = True
 
         # If no mask-based seed, try previous stored path
         if (x_seed is None or y_seed is None) and prev_path is not None:
@@ -1283,16 +1595,71 @@ class SeismicPredictor:
         if x_seed is None or y_seed is None or len(x_seed) == 0:
             return None
 
+        # Optional dip-steered centerline
+        band_centerline = None
+        if use_dip_band:
+            try:
+                theta = self._compute_orientation_map(slice_data, sigma=dip_sigma)
+                h, w = slice_data.shape
+                # Choose anchor column from available seed path (more robust than mid-column)
+                if x_seed is not None and len(x_seed) > 0:
+                    x_start = int(np.clip(np.median(x_seed.astype(float)), 0, w - 1))
+                elif prev_path is not None and prev_path[0] is not None and len(prev_path[0]) > 0:
+                    x_start = int(np.clip(np.median(np.asarray(prev_path[0], dtype=float)), 0, w - 1))
+                else:
+                    x_start = int(w // 2)
+                y_start = None
+                if x_seed is not None and y_seed is not None and len(x_seed) > 0:
+                    # interpolate y at anchor column from seed
+                    try:
+                        y_start = float(np.interp(x_start, x_seed.astype(float), y_seed.astype(float)))
+                    except Exception:
+                        y_start = float(np.median(y_seed))
+                if y_start is None and prev_path is not None:
+                    x_prev, y_prev = prev_path
+                    try:
+                        y_start = float(np.interp(x_start, np.asarray(x_prev, dtype=float), np.asarray(y_prev, dtype=float)))
+                    except Exception:
+                        y_start = float(np.median(y_prev)) if y_prev is not None else float(h // 2)
+                if y_start is None:
+                    y_start = float(h // 2)
+                band_centerline = self._centerline_from_dip(theta, y_start, x_start, max_slope=max_slope, smooth_k=max(3, snap_kernel))
+                # Recenter the band onto the actual reflector extrema
+                band_centerline = self._recenter_centerline(slice_data, band_centerline, mode=mode, recenter_window=band_half_width)
+            except Exception:
+                band_centerline = None
+
+        # If the dip-steered band disagrees with the seed path (e.g., direction change),
+        # override the seed with the band to prioritize data over initial prompts
+        if (not seed_from_mask) and use_dip_band and band_centerline is not None and x_seed is not None and y_seed is not None and len(x_seed) > 0:
+            xi = np.clip(x_seed.astype(int), 0, len(band_centerline) - 1)
+            band_at_x = band_centerline[xi]
+            if band_at_x is not None and np.isfinite(band_at_x).any():
+                diff = np.abs(y_seed - band_at_x)
+                if diff.size > 0:
+                    med = float(np.nanmedian(diff))
+                    thr = max(3.0, 0.6 * float(band_half_width))
+                    frac = float(np.mean(diff > thr)) if diff.size else 0.0
+                    if med > thr or frac > 0.35:
+                        # Override seed to follow dip band (prevents sticking to early prompts)
+                        y_seed = band_at_x.astype(float)
+
+        # Densify seed to cover full width to avoid gaps/dual-lines and improve edge coverage
+        h, w = slice_data.shape
+        x_dense, y_dense = self._densify_seed(x_seed, y_seed, w, band_centerline=band_centerline)
+
         # Snap to nearest reflector
         y_snapped, conf_pts, conf_mean = self.snap_polyline_to_reflector(
-            slice_data, x_seed, y_seed, mode=mode, window=snap_window, kernel_size=snap_kernel
+            slice_data, x_dense, y_dense, mode=mode, window=snap_window, kernel_size=snap_kernel,
+            band_centerline=band_centerline, band_half_width=band_half_width
         )
         if y_snapped is None:
             return None
 
         # Smooth with DP around snapped path
         y_refined = self.dynamic_programming_refine(
-            slice_data, x_seed, y_snapped, mode=mode, dp_window=dp_window, lam_smooth=dp_lambda, kernel_size=snap_kernel
+            slice_data, x_dense, y_snapped, mode=mode, dp_window=dp_window, lam_smooth=dp_lambda, kernel_size=snap_kernel,
+            band_centerline=band_centerline, band_half_width=band_half_width
         )
         if y_refined is None:
             return None
@@ -1309,9 +1676,9 @@ class SeismicPredictor:
         slice_key = f"{slice_type}_{slice_idx}"
         if obj_id not in self.horizon_paths:
             self.horizon_paths[obj_id] = {}
-        self.horizon_paths[obj_id][slice_key] = {"x": x_seed.astype(int), "y": y_refined.astype(float), "confidence": conf}
+        self.horizon_paths[obj_id][slice_key] = {"x": x_dense.astype(int), "y": y_refined.astype(float), "confidence": conf}
 
-        return x_seed, y_refined, conf
+        return x_dense, y_refined, conf
 
     def get_prev_horizon(self, obj_id, slice_type, slice_idx):
         """Get the previous slice's refined horizon path if available."""
