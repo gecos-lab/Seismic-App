@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QSlider, QLineEdit, QSpinBox, QRadioButton, 
                                QButtonGroup, QProgressBar, QMenuBar, QMenu, 
                                QMessageBox, QFileDialog, QFrame, QSizePolicy,
-                               QGroupBox, QCheckBox, QInputDialog)
+                               QGroupBox, QCheckBox, QInputDialog, QComboBox, QDoubleSpinBox)
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QAction, QPixmap
 import threading
@@ -103,6 +103,16 @@ class SeismicApp(QMainWindow):
         self._drawing_mode = "foreground"
         self._status_text = "Ready. Load a SEGY file to begin."
         self._progress_value = 0.0
+
+        # Horizon refinement settings (defaults)
+        self.auto_snap_enabled = True
+        self.show_horizon_enabled = True
+        self.snap_mode = "peak"            # 'peak' | 'trough' | 'zero'
+        self.snap_window = 8                # vertical half-window for snapping
+        self.dp_window = 8                  # vertical half-window for DP
+        self.dp_lambda = 1.0               # smoothness strength
+        self.horizon_min_conf = 0.35       # confidence gate
+        self.snap_kernel = 7               # moving-average kernel for ridge-aware snapping
         
         # Initialize point collection per object ID
         self.object_annotations = {} # Stores {'points': [], 'labels': []} for each object ID
@@ -377,6 +387,68 @@ class SeismicApp(QMainWindow):
         self.main_layout.addWidget(control_group)
         
         # Canvas for displaying the slice and annotations
+        # Horizon refinement controls
+        horizon_group = QGroupBox("Horizon")
+        horizon_layout = QHBoxLayout(horizon_group)
+
+        self.auto_snap_checkbox = QCheckBox("Auto Snap")
+        self.auto_snap_checkbox.setChecked(self.auto_snap_enabled)
+        self.auto_snap_checkbox.toggled.connect(self._on_auto_snap_changed)
+        horizon_layout.addWidget(self.auto_snap_checkbox)
+
+        self.show_horizon_checkbox = QCheckBox("Show")
+        self.show_horizon_checkbox.setChecked(self.show_horizon_enabled)
+        self.show_horizon_checkbox.toggled.connect(self._on_show_horizon_changed)
+        horizon_layout.addWidget(self.show_horizon_checkbox)
+
+        horizon_layout.addWidget(QLabel("Mode:"))
+        self.snap_mode_combo = QComboBox()
+        self.snap_mode_combo.addItems(["Peak", "Trough", "Zero"])
+        self.snap_mode_combo.setCurrentText("Peak")
+        self.snap_mode_combo.currentTextChanged.connect(self._on_snap_mode_changed)
+        horizon_layout.addWidget(self.snap_mode_combo)
+
+        horizon_layout.addWidget(QLabel("Snap W:"))
+        self.snap_window_spin = QSpinBox()
+        self.snap_window_spin.setRange(1, 50)
+        self.snap_window_spin.setValue(self.snap_window)
+        self.snap_window_spin.valueChanged.connect(self._on_snap_window_changed)
+        horizon_layout.addWidget(self.snap_window_spin)
+
+        horizon_layout.addWidget(QLabel("DP W:"))
+        self.dp_window_spin = QSpinBox()
+        self.dp_window_spin.setRange(1, 50)
+        self.dp_window_spin.setValue(self.dp_window)
+        self.dp_window_spin.valueChanged.connect(self._on_dp_window_changed)
+        horizon_layout.addWidget(self.dp_window_spin)
+
+        horizon_layout.addWidget(QLabel("Smooth:"))
+        self.dp_lambda_spin = QDoubleSpinBox()
+        self.dp_lambda_spin.setRange(0.0, 5.0)
+        self.dp_lambda_spin.setSingleStep(0.1)
+        self.dp_lambda_spin.setValue(self.dp_lambda)
+        self.dp_lambda_spin.valueChanged.connect(self._on_dp_lambda_changed)
+        horizon_layout.addWidget(self.dp_lambda_spin)
+
+        horizon_layout.addWidget(QLabel("MinConf:"))
+        self.min_conf_spin = QDoubleSpinBox()
+        self.min_conf_spin.setRange(0.0, 1.0)
+        self.min_conf_spin.setSingleStep(0.05)
+        self.min_conf_spin.setValue(self.horizon_min_conf)
+        self.min_conf_spin.valueChanged.connect(self._on_min_conf_changed)
+        horizon_layout.addWidget(self.min_conf_spin)
+
+        horizon_layout.addWidget(QLabel("Kernel:"))
+        self.snap_kernel_spin = QSpinBox()
+        self.snap_kernel_spin.setRange(1, 31)
+        self.snap_kernel_spin.setSingleStep(2)
+        self.snap_kernel_spin.setValue(self.snap_kernel)
+        self.snap_kernel_spin.valueChanged.connect(self._on_snap_kernel_changed)
+        horizon_layout.addWidget(self.snap_kernel_spin)
+
+        self.main_layout.addWidget(horizon_group)
+
+        # Canvas for displaying the slice and annotations
         canvas_widget = QWidget()
         canvas_layout = QVBoxLayout(canvas_widget)
         
@@ -425,6 +497,44 @@ class SeismicApp(QMainWindow):
         self.error_occurred.connect(self._show_error)
         self.scale_updated.connect(self._update_scale)
         self.mask_ready.connect(self._display_mask)
+
+    # --- Horizon controls handlers ---
+    def _on_auto_snap_changed(self, checked):
+        self.auto_snap_enabled = bool(checked)
+        self._load_current_slice()
+
+    def _on_show_horizon_changed(self, checked):
+        self.show_horizon_enabled = bool(checked)
+        self._load_current_slice()
+
+    def _on_snap_mode_changed(self, text):
+        self.snap_mode = str(text).lower()
+        self._load_current_slice()
+
+    def _on_snap_window_changed(self, value):
+        self.snap_window = int(value)
+        self._load_current_slice()
+
+    def _on_dp_window_changed(self, value):
+        self.dp_window = int(value)
+        self._load_current_slice()
+
+    def _on_dp_lambda_changed(self, value):
+        self.dp_lambda = float(value)
+        self._load_current_slice()
+
+    def _on_min_conf_changed(self, value):
+        self.horizon_min_conf = float(value)
+        self._load_current_slice()
+    
+    def _on_snap_kernel_changed(self, value):
+        v = int(value)
+        if v % 2 == 0:
+            v = max(1, v - 1)
+        self.snap_kernel = v
+        if self.snap_kernel_spin.value() != v:
+            self.snap_kernel_spin.setValue(v)
+        self._load_current_slice()
     
     def _update_status(self, text):
         """Update status label"""
@@ -485,7 +595,7 @@ class SeismicApp(QMainWindow):
         
         # Display the slice
         vmin, vmax = np.percentile(self.current_slice, [5, 95])
-        self.ax.imshow(self.current_slice, cmap='seismic', vmin=vmin, vmax=vmax, aspect='auto')
+        self.ax.imshow(self.current_slice, cmap='gray', vmin=vmin, vmax=vmax, aspect='auto')
         
         # Get current object ID for highlighting
         current_obj_id = self.current_object_id.get()
@@ -526,6 +636,54 @@ class SeismicApp(QMainWindow):
         
         # Redraw canvas
         self.canvas.draw()
+        
+        # Optionally overlay refined horizon for current object
+        try:
+            if self.show_horizon_enabled:
+                slice_type = self.current_slice_type.get()
+                slice_idx = self.current_slice_idx.get()
+                obj_id = self.current_object_id.get()
+                # Prefer mask if available for the current object
+                seed_mask = None
+                try:
+                    seed_mask = self.predictor.get_mask_for_frame(slice_idx, obj_id)
+                except Exception:
+                    seed_mask = None
+                prev_path = self.predictor.get_prev_horizon(obj_id, slice_type, slice_idx)
+                if self.auto_snap_enabled or prev_path is not None:
+                    result = self.predictor.refine_horizon(
+                        obj_id,
+                        slice_type,
+                        slice_idx,
+                        self.current_slice,
+                        seed_mask=seed_mask,
+                        prev_path=prev_path,
+                        mode=self.snap_mode,
+                        snap_window=self.snap_window,
+                        dp_window=self.dp_window,
+                        dp_lambda=self.dp_lambda,
+                        snap_kernel=self.snap_kernel
+                    )
+                    if result is not None:
+                        x_h, y_h, conf = result
+                        # Color by confidence
+                        colors = plt.get_cmap('tab10').colors
+                        obj_color = colors[(obj_id - 1) % len(colors)]
+                        if conf < self.horizon_min_conf:
+                            line_color = 'red'
+                            line_style = '--'
+                            self.status_text.set(f"Low horizon confidence on slice {slice_idx} (Obj {obj_id}). Consider re-seed.")
+                        elif conf < min(1.0, self.horizon_min_conf + 0.25):
+                            line_color = 'orange'
+                            line_style = '-.'
+                        else:
+                            line_color = obj_color
+                            line_style = '-'
+                        self.ax.plot(x_h, y_h, line_style, color=line_color, linewidth=2.0, label=f"Horizon Obj {obj_id}")
+                        self.ax.legend()
+                        self.canvas.draw()
+        except Exception as e:
+            print(f"Horizon overlay failed: {e}")
     
     def _open_segy_file(self):
         """Open a SEGY file dialog and load the selected file"""
@@ -975,7 +1133,7 @@ class SeismicApp(QMainWindow):
         
         # Display the slice
         vmin, vmax = np.percentile(self.current_slice, [5, 95])
-        self.ax.imshow(self.current_slice, cmap='seismic', vmin=vmin, vmax=vmax, aspect='auto')
+        self.ax.imshow(self.current_slice, cmap='gray', vmin=vmin, vmax=vmax, aspect='auto')
         
         # Get current slice info
         slice_type = self.current_slice_type.get()
@@ -1066,6 +1224,49 @@ class SeismicApp(QMainWindow):
         
         # Redraw canvas
         self.canvas.draw()
+
+        # Overlay refined horizon after masks to keep it visible
+        try:
+            if self.show_horizon_enabled:
+                slice_type = self.current_slice_type.get()
+                slice_idx = self.current_slice_idx.get()
+                obj_id = self.current_object_id.get()
+                seed_mask = None
+                try:
+                    seed_mask = self.predictor.get_mask_for_frame(slice_idx, obj_id)
+                except Exception:
+                    seed_mask = None
+                prev_path = self.predictor.get_prev_horizon(obj_id, slice_type, slice_idx)
+                if self.auto_snap_enabled or prev_path is not None:
+                    result = self.predictor.refine_horizon(
+                        obj_id,
+                        slice_type,
+                        slice_idx,
+                        self.current_slice,
+                        seed_mask=seed_mask,
+                        prev_path=prev_path,
+                        mode=self.snap_mode,
+                        snap_window=self.snap_window,
+                        dp_window=self.dp_window,
+                        dp_lambda=self.dp_lambda,
+                        snap_kernel=self.snap_kernel
+                    )
+                    if result is not None:
+                        x_h, y_h, conf = result
+                        colors = plt.get_cmap('tab10').colors
+                        obj_color = colors[(obj_id - 1) % len(colors)]
+                        if conf < self.horizon_min_conf:
+                            line_color = 'red'; line_style = '--'
+                            self.status_text.set(f"Low horizon confidence on slice {slice_idx} (Obj {obj_id}). Consider re-seed.")
+                        elif conf < min(1.0, self.horizon_min_conf + 0.25):
+                            line_color = 'orange'; line_style = '-.'
+                        else:
+                            line_color = obj_color; line_style = '-'
+                        self.ax.plot(x_h, y_h, line_style, color=line_color, linewidth=2.0, label=f"Horizon Obj {obj_id}")
+                        self.ax.legend()
+                        self.canvas.draw()
+        except Exception as e:
+            print(f"Horizon overlay (mask path) failed: {e}")
     
     def process_queue(self):
         """Process messages from worker threads"""
@@ -1486,7 +1687,7 @@ class SeismicApp(QMainWindow):
                          grid.point_data["intensity"] = norm_data.flatten()
                          
                          # Add mesh to plotter with seismic colormap
-                         plotter.add_mesh(grid, cmap="seismic", point_size=3, render_points_as_spheres=True, scalars="intensity")
+                         plotter.add_mesh(grid, cmap="gray", point_size=3, render_points_as_spheres=True, scalars="intensity")
                          
                          # Add delimiter plane (optional, can be removed if too cluttered)
                          # ... (delimiter code can remain or be removed) ...
@@ -1573,7 +1774,7 @@ class SeismicApp(QMainWindow):
                     
                     # Create a simple cube as placeholder
                     mesh = pv.Cube()
-                    plotter.add_mesh(mesh, cmap="seismic")
+                    plotter.add_mesh(mesh, cmap="gray")
                     
                     # Save to temporary file
                     import tempfile
@@ -1978,11 +2179,15 @@ class SeismicApp(QMainWindow):
                             surf = surf.extract_surface()
                         except:
                             # If both fail, try a backup using scipy and manual face creation
-                            hull = scipy.spatial.ConvexHull(points)
-                            faces = []
-                            for simplex in hull.simplices:
-                                faces.append([3, simplex[0], simplex[1], simplex[2]])
-                            surf = pv.PolyData(points, faces=np.array(faces))
+                            try:
+                                from scipy.spatial import ConvexHull
+                                hull = ConvexHull(points)
+                                faces = []
+                                for simplex in hull.simplices:
+                                    faces.append([3, simplex[0], simplex[1], simplex[2]])
+                                surf = pv.PolyData(points, faces=np.array(faces))
+                            except Exception:
+                                surf = None
                             
                     # If we have a surface, add it to the plotter
                     if surf is not None:
@@ -2161,7 +2366,7 @@ class SeismicApp(QMainWindow):
                     grid.point_data["values"] = norm_data.flatten(order='F')
                     
                     # Add the slice to the plotter - use seismic colormap to match 3D visualization
-                    plotter.add_mesh(grid, scalars="values", opacity=0.5, cmap="seismic", show_edges=False)
+                    plotter.add_mesh(grid, scalars="values", opacity=0.5, cmap="gray", show_edges=False)
                     
                     # Add a delimiter plane to match 3D visualization
                     # Note: Use the PyVista Plane parameters correctly without k_size
@@ -2433,7 +2638,7 @@ class SeismicApp(QMainWindow):
                      vmin, vmax = np.percentile(slice_data, [5, 95]); norm_data = np.clip(slice_data, vmin, vmax)
                      norm_data = (norm_data - vmin) / (vmax - vmin) if (vmax - vmin) > 1e-6 else np.zeros_like(slice_data)
                      grid.point_data["intensity"] = norm_data.flatten()
-                     plotter.add_mesh(grid, cmap="seismic", point_size=3, render_points_as_spheres=True, scalars="intensity")
+                     plotter.add_mesh(grid, cmap="gray", point_size=3, render_points_as_spheres=True, scalars="intensity")
 
                  # Add masks for all objects (copy relevant parts from _create_3d_visualization)
                  for current_obj_id_to_display in all_known_obj_ids:

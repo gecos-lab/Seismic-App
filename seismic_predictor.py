@@ -54,6 +54,8 @@ class SeismicPredictor:
         self.object_masks = {}  # Stores masks per object ID: {obj_id: {slice_key: mask}}
         self.inference_state = {} # Stores video inference state per object ID: {obj_id: state}
         self.demo_state = {} # Stores demo mode state per object ID: {obj_id: state_info}
+        self.horizon_paths = {} # Stores per-object refined horizon per slice: {obj_id: {slice_key: {"x": [], "y": [], "confidence": float}}}
+        self.slice_maps = {} # Maps selected slice indices to frame indices per object for video predictor
         
     def load_model(self):
         """Load the SAM2 model"""
@@ -1032,7 +1034,7 @@ class SeismicPredictor:
         ax = fig.add_subplot(111)
         
         # Display slice with 'gray' colormap for better contrast
-        ax.imshow(slice_data, cmap='seismic', vmin=vmin, vmax=vmax, aspect='auto')
+        ax.imshow(slice_data, cmap='gray', vmin=vmin, vmax=vmax, aspect='auto')
         
         # Create mask overlay
         mask_overlay = np.zeros((*mask.shape, 4))
@@ -1048,3 +1050,273 @@ class SeismicPredictor:
         ax.set_title(f"{self.current_slice_type.capitalize()} {self.current_slice_idx} with Mask")
         
         return fig 
+
+    # --- Horizon refinement utilities ---
+    def mask_to_polyline(self, mask):
+        """Extract a simple centerline polyline from a binary mask.
+
+        For each x-column, take the median y-position of True pixels as the centerline.
+
+        Returns:
+            x_coords: 1D numpy array of x positions (columns with mask coverage)
+            y_coords: 1D numpy array of y positions (row index per x)
+        """
+        if mask is None:
+            return None, None
+        if mask.ndim != 2:
+            mask = np.squeeze(mask)
+        if mask.dtype != bool:
+            mask = mask.astype(bool)
+
+        h, w = mask.shape
+        xs = []
+        ys = []
+        # Iterate over columns
+        for x in range(w):
+            y_idx = np.flatnonzero(mask[:, x])
+            if y_idx.size == 0:
+                continue
+            # Use median to be robust to outliers
+            y_med = int(np.median(y_idx))
+            xs.append(x)
+            ys.append(y_med)
+        if not xs:
+            return None, None
+        return np.asarray(xs, dtype=int), np.asarray(ys, dtype=float)
+
+    def _smooth_1d(self, v, kernel_size):
+        """Simple moving-average smoothing with odd kernel_size."""
+        v = np.asarray(v, dtype=float)
+        k = max(1, int(kernel_size))
+        if k % 2 == 0:
+            k += 1
+        if k <= 1:
+            return v
+        kernel = np.ones(k, dtype=float) / float(k)
+        # Reflect padding to preserve edges
+        pad = k // 2
+        vp = np.pad(v, (pad, pad), mode='reflect')
+        vs = np.convolve(vp, kernel, mode='valid')
+        return vs
+
+    def _reflector_data_score(self, v, mode, kernel_size=1):
+        """Compute a per-sample data score for a vertical trace segment v.
+
+        Lower is better (used as cost). Mode can be 'peak', 'trough', or 'zero'.
+        Uses smoothed amplitude, gradient and curvature for ridge-aware selection.
+        """
+        v = np.asarray(v, dtype=float)
+        eps = 1e-6
+        vs = self._smooth_1d(v, kernel_size)
+        g = np.gradient(vs)
+        c = np.gradient(g)
+        # Normalize signals
+        a = vs / (np.mean(np.abs(vs)) + eps)
+        g_n = g / (np.mean(np.abs(g)) + eps)
+        c_n = c / (np.mean(np.abs(c)) + eps)
+
+        if mode == 'peak':
+            # Favor strong positive amplitude (large a), near zero gradient, negative curvature (local max)
+            cost = -a + 0.25 * np.abs(g_n) + (-0.5) * np.minimum(c_n, 0.0)
+        elif mode == 'trough':
+            # Favor strong negative amplitude (large -a), near zero gradient, positive curvature (local min)
+            cost = a + 0.25 * np.abs(g_n) + (-0.5) * np.maximum(c_n, 0.0)  # a is negative for troughs, so higher a→worse, keep as is
+        else:  # 'zero'
+            # Favor amplitude near zero but steep gradient; curvature neutral
+            cost = np.abs(a) - 0.6 * np.abs(g_n) + 0.1 * np.abs(c_n)
+
+        return cost
+
+    def snap_polyline_to_reflector(self, slice_data, x_coords, y_coords, mode='peak', window=8, kernel_size=7):
+        """Snap an input polyline to the nearest reflector (peak/trough/zero) within a vertical window.
+
+        Returns:
+            y_snapped: numpy array of y positions after snapping
+            point_conf: numpy array of confidence per point in [0, 1]
+            mean_conf: float average confidence
+        """
+        if x_coords is None or y_coords is None:
+            return None, None, 0.0
+        h, w = slice_data.shape
+        y_snapped = np.copy(y_coords).astype(float)
+        point_conf = np.zeros_like(y_snapped, dtype=float)
+        eps = 1e-6
+
+        for i, x in enumerate(x_coords):
+            y0 = int(round(y_coords[i]))
+            y_min = max(0, y0 - int(window))
+            y_max = min(h - 1, y0 + int(window))
+            if y_max < y_min:
+                continue
+            v = slice_data[y_min:y_max + 1, int(x)]
+
+            # Build score (lower is better)
+            cost = self._reflector_data_score(v, mode, kernel_size=kernel_size)
+            # Choose best index
+            j = int(np.argmin(cost))
+            y_best = y_min + j
+            y_snapped[i] = y_best
+
+            # Confidence: normalize relative improvement vs. median cost
+            c_best = float(cost[j])
+            c_med = float(np.median(cost))
+            c_std = float(np.std(cost)) + eps
+            # Map to [0,1]: higher improvement => higher confidence
+            z = (c_med - c_best) / c_std
+            point_conf[i] = 1.0 / (1.0 + np.exp(-z))  # sigmoid
+
+        mean_conf = float(np.nanmean(point_conf)) if point_conf.size else 0.0
+        return y_snapped, point_conf, mean_conf
+
+    def _split_contiguous(self, x_coords):
+        """Split indices into contiguous segments where x increments by 1."""
+        if x_coords is None or len(x_coords) == 0:
+            return []
+        segments = []
+        start = 0
+        for i in range(1, len(x_coords)):
+            if x_coords[i] != x_coords[i - 1] + 1:
+                segments.append((start, i))
+                start = i
+        segments.append((start, len(x_coords)))
+        return segments
+
+    def dynamic_programming_refine(self, slice_data, x_coords, y_seed, mode='peak', dp_window=8, lam_smooth=1.0, kernel_size=7):
+        """Refine a horizon path with a simple dynamic programming smoother.
+
+        Args:
+            slice_data: 2D numpy array (H, W)
+            x_coords: 1D array of x positions (assumed increasing)
+            y_seed: 1D array of initial y positions (same length as x_coords)
+            mode: 'peak' | 'trough' | 'zero'
+            dp_window: vertical search half-window around y_seed
+            lam_smooth: smoothness penalty weight (|y_i - y_{i-1}|)
+
+        Returns:
+            y_refined: 1D array of refined y positions
+        """
+        if x_coords is None or y_seed is None or len(x_coords) == 0:
+            return None
+        h, w = slice_data.shape
+        x_coords = np.asarray(x_coords, dtype=int)
+        y_seed = np.asarray(y_seed, dtype=float)
+
+        y_out = np.copy(y_seed)
+
+        # Process contiguous x segments to keep DP small
+        for s, e in self._split_contiguous(x_coords):
+            xs = x_coords[s:e]
+            ys0 = y_seed[s:e]
+            if len(xs) == 0:
+                continue
+
+            # Build candidate sets per position
+            cand_list = []
+            cost_list = []
+            for i, x in enumerate(xs):
+                y0 = int(round(ys0[i]))
+                y_min = max(0, y0 - int(dp_window))
+                y_max = min(h - 1, y0 + int(dp_window))
+                if y_max < y_min:
+                    # Fallback to current y
+                    y_min = y0
+                    y_max = y0
+                cand_y = np.arange(y_min, y_max + 1, dtype=int)
+                v = slice_data[cand_y, int(x)]
+                data_cost = self._reflector_data_score(v, mode, kernel_size=kernel_size)
+                cand_list.append(cand_y)
+                cost_list.append(data_cost)
+
+            # DP tables
+            # Initialize with first column
+            J0 = cost_list[0]
+            prev_cost = np.array(J0, dtype=float)
+            back_ptrs = []
+
+            # Forward pass
+            for i in range(1, len(xs)):
+                y_prev = cand_list[i - 1]
+                y_curr = cand_list[i]
+                data_cost = cost_list[i]
+                new_cost = np.full_like(data_cost, np.inf, dtype=float)
+                back_idx = np.full_like(data_cost, -1, dtype=int)
+
+                for j, yc in enumerate(y_curr):
+                    # Smoothness term relative to all previous candidates
+                    smooth = lam_smooth * np.abs(y_prev - yc)
+                    c = prev_cost + smooth
+                    k = int(np.argmin(c))
+                    new_cost[j] = float(c[k]) + float(data_cost[j])
+                    back_idx[j] = k
+                prev_cost = new_cost
+                back_ptrs.append(back_idx)
+
+            # Backtrack
+            y_ref = np.zeros(len(xs), dtype=float)
+            k = int(np.argmin(prev_cost))
+            y_ref[-1] = float(cand_list[-1][k])
+            for i in range(len(xs) - 2, -1, -1):
+                k = int(back_ptrs[i][k])
+                y_ref[i] = float(cand_list[i][k])
+
+            # Write back
+            y_out[s:e] = y_ref
+
+        return y_out
+
+    def refine_horizon(self, obj_id, slice_type, slice_idx, slice_data, seed_mask=None, prev_path=None,
+                       mode='peak', snap_window=8, dp_window=8, dp_lambda=1.0, snap_kernel=7):
+        """Refine a horizon from a seed (mask or previous path), snap to reflector, and smooth.
+
+        Stores the result internally and returns (x, y, confidence).
+        """
+        # Decide seed polyline
+        x_seed, y_seed = (None, None)
+        if seed_mask is not None:
+            x_seed, y_seed = self.mask_to_polyline(seed_mask)
+
+        # If no mask-based seed, try previous stored path
+        if (x_seed is None or y_seed is None) and prev_path is not None:
+            x_prev, y_prev = prev_path
+            x_seed, y_seed = np.asarray(x_prev, dtype=int), np.asarray(y_prev, dtype=float)
+
+        if x_seed is None or y_seed is None or len(x_seed) == 0:
+            return None
+
+        # Snap to nearest reflector
+        y_snapped, conf_pts, conf_mean = self.snap_polyline_to_reflector(
+            slice_data, x_seed, y_seed, mode=mode, window=snap_window, kernel_size=snap_kernel
+        )
+        if y_snapped is None:
+            return None
+
+        # Smooth with DP around snapped path
+        y_refined = self.dynamic_programming_refine(
+            slice_data, x_seed, y_snapped, mode=mode, dp_window=dp_window, lam_smooth=dp_lambda, kernel_size=snap_kernel
+        )
+        if y_refined is None:
+            return None
+
+        # Confidence: combine snapping confidence and local consistency (stability wrt snapped)
+        if conf_pts is None or len(conf_pts) != len(y_refined):
+            conf = float(conf_mean) if conf_pts is not None else 0.0
+        else:
+            delta = np.abs(y_refined - y_snapped)
+            stable = np.clip(1.0 - (delta / (dp_window + 1e-6)), 0.0, 1.0)
+            conf = float(0.6 * conf_mean + 0.4 * float(np.nanmean(stable)))
+
+        # Store
+        slice_key = f"{slice_type}_{slice_idx}"
+        if obj_id not in self.horizon_paths:
+            self.horizon_paths[obj_id] = {}
+        self.horizon_paths[obj_id][slice_key] = {"x": x_seed.astype(int), "y": y_refined.astype(float), "confidence": conf}
+
+        return x_seed, y_refined, conf
+
+    def get_prev_horizon(self, obj_id, slice_type, slice_idx):
+        """Get the previous slice's refined horizon path if available."""
+        prev_key = f"{slice_type}_{slice_idx - 1}"
+        if obj_id in self.horizon_paths and prev_key in self.horizon_paths[obj_id]:
+            p = self.horizon_paths[obj_id][prev_key]
+            return p["x"], p["y"]
+        return None
