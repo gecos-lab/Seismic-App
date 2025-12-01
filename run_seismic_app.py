@@ -17,7 +17,10 @@ Examples:
   python run_seismic_app.py                       # Run with default base-plus model 
   python run_seismic_app.py --model large         # Run with large model for best accuracy
   python run_seismic_app.py --model tiny          # Run with tiny model for better performance
+  python run_seismic_app.py --model tiny          # Run with tiny model for better performance
   python run_seismic_app.py --demo                # Run in demo mode (no model loading)
+  python run_seismic_app.py --sam3                # Run with SAM3 model (requires sam3 package)
+
 
 Troubleshooting:
   If you encounter model loading errors:
@@ -45,7 +48,20 @@ Troubleshooting:
 """
 
 import sys
+import os
+
+# Fix for Qt platform plugin "windows" not found
+try:
+    import PySide6
+    qt_plugin_path = os.path.join(os.path.dirname(PySide6.__file__), "plugins")
+    if os.path.exists(qt_plugin_path):
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(qt_plugin_path, "platforms")
+        os.environ["QT_PLUGIN_PATH"] = qt_plugin_path
+        print(f"Set Qt plugin path to: {qt_plugin_path}")
+except ImportError:
+    pass
+
 from app import main
 
 if __name__ == "__main__":
-    main() 
+    main()

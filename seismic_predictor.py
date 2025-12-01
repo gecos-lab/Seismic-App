@@ -5,6 +5,9 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import os
 import sys
+from typing import Dict, List, Tuple, Optional
+import threading
+import queue
 
 # Add parent directory to path for importing SAM2
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -18,13 +21,106 @@ except ImportError:
     print("Warning: SAM2 modules not available. Running in demo mode.")
     SAM2_AVAILABLE = False
 
+# Import new autotracking modules
+AUTOTRACKING_AVAILABLE = False
+try:
+    from seismic_attributes import SeismicAttributes
+    from autotracker import Autotracker, TrackingMode
+    AUTOTRACKING_AVAILABLE = True
+except ImportError:
+    print("Warning: Autotracking modules not available. Using fallback mode.")
+    AUTOTRACKING_AVAILABLE = False
+
+# Fallback enum definition for when autotracker import fails
+if not AUTOTRACKING_AVAILABLE:
+    from enum import Enum
+    class TrackingMode(Enum):
+        ATTRIBUTE_GUIDED = "attribute_guided"
+        EDGE_BASED = "edge_based"
+        PHASE_GUIDED = "phase_guided"
+        SIMILARITY_GUIDED = "similarity_guided"
+        HYBRID = "hybrid"
+
+# Fallback autotracker class for when full autotracking is not available
+class FallbackAutotracker:
+    """Simple fallback autotracker using existing SAM2 propagation."""
+
+    def __init__(self, seismic_volume=None):
+        self.seismic_volume = seismic_volume
+
+    def set_seismic_volume(self, volume):
+        """Set the seismic volume."""
+        self.seismic_volume = volume
+
+    def auto_detect_seeds(self, slice_data, slice_idx, n_seeds=10, method='from_points',
+                         existing_points=None, existing_masks=None):
+        """Fallback seed detection using existing points and masks."""
+        print(f"Fallback autotracker: Detecting seeds using {method}")
+
+        if method == 'from_points' and existing_points:
+            print(f"Using {len(existing_points)} existing foreground points as seeds")
+            return existing_points[:n_seeds]
+
+        elif method == 'from_masks' and existing_masks:
+            seed_candidates = []
+            for obj_id, mask in existing_masks.items():
+                if mask is not None and np.any(mask):
+                    y_coords, x_coords = np.where(mask)
+                    if len(y_coords) > 0:
+                        center_y = int(np.mean(y_coords))
+                        center_x = int(np.mean(x_coords))
+                        seed_candidates.append((center_x, center_y))
+            return seed_candidates[:n_seeds]
+
+        # Fallback: return center point or random points
+        h, w = slice_data.shape
+        center_point = (w // 2, h // 2)
+        return [center_point]
+
+    def track_horizon_dp(self, start_slice_idx, start_points, direction='forward',
+                        max_slices=50, mode=None):
+        """Fallback tracking using simple point propagation."""
+        mode_name = mode.value if hasattr(mode, 'value') else str(mode or 'fallback')
+        print(f"Fallback autotracker: Tracking {len(start_points)} points {direction} from slice {start_slice_idx} using {mode_name}")
+
+        # Simple tracking: just return the same points for all slices
+        paths = {}
+        confidences = {}
+
+        for i, point in enumerate(start_points):
+            path_id = f"path_{i}"
+            paths[path_id] = [point] * min(max_slices, 10)  # Repeat point
+            confidences[path_id] = [0.5] * min(max_slices, 10)  # Low confidence
+
+        return {
+            'paths': paths,
+            'confidences': confidences,
+            'start_slice': start_slice_idx,
+            'direction': direction,
+            'mode': mode_name
+        }
+
+    def track_multiple_horizons(self, start_slice_idx, n_horizons=3, direction='forward', max_slices=50):
+        """Fallback multiple horizon tracking."""
+        print(f"Fallback autotracker: Tracking {n_horizons} horizons")
+        return {'horizons': [], 'n_tracked': 0}
+
+    def compute_tracking_quality(self, tracking_results):
+        """Fallback quality metrics."""
+        return {
+            'mean_confidence': 0.5,
+            'path_smoothness': 0.5,
+            'attribute_consistency': 0.5,
+            'overall_quality': 0.5
+        }
+
 class SeismicPredictor:
     def __init__(self, model_id="facebook/sam2-hiera-base-plus", demo_mode=False):
         """Initialize the Seismic Predictor with SAM2 model
-        
+
         Args:
             model_id: HuggingFace model ID for SAM2
-                Recommended models: 
+                Recommended models:
                 - "facebook/sam2-hiera-base-plus" (base+ model, good balance of speed and accuracy)
                 - "facebook/sam2-hiera-large" (large model, most accurate but slower)
                 - "facebook/sam2-hiera-small" (small model, faster)
@@ -38,22 +134,51 @@ class SeismicPredictor:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         print(f"Demo mode: {self.demo_mode}")
-        
+
         # Load SAM2 model from pretrained
         self.sam_model = None
         self.image_predictor = None
         self.video_predictor = None
-        
+
         # Seismic data
         self.seismic_volume = None
         self.current_slice_type = None  # "inline", "crossline", or "timeslice"
         self.current_slice_idx = None
         self.current_slice = None
-        
+
+        # Point annotations per object ID (for compatibility with app)
+        self.object_annotations = {} # Stores {'points': [], 'labels': []} for each object ID
+
         # Prediction results per object ID
         self.object_masks = {}  # Stores masks per object ID: {obj_id: {slice_key: mask}}
         self.inference_state = {} # Stores video inference state per object ID: {obj_id: state}
         self.demo_state = {} # Stores demo mode state per object ID: {obj_id: state_info}
+
+        # Autotracking components
+        self.attributes_processor = None
+        self.autotracker = None
+
+        # Try to initialize full autotracking
+        autotracking_initialized = False
+        if AUTOTRACKING_AVAILABLE:
+            try:
+                self.attributes_processor = SeismicAttributes(use_gpu=torch.cuda.is_available())
+                self.autotracker = Autotracker(seismic_volume=self.seismic_volume,
+                                             attributes_processor=self.attributes_processor)
+                autotracking_initialized = True
+                print("Full autotracking system initialized")
+            except Exception as e:
+                print(f"Failed to initialize full autotracking: {e}, using fallback")
+                autotracking_initialized = False
+
+        # Fallback autotracker if full autotracking failed or not available
+        if not autotracking_initialized:
+            self.autotracker = FallbackAutotracker(seismic_volume=self.seismic_volume)
+            print("Using fallback autotracker")
+
+        # Autotracking results
+        self.auto_tracked_horizons = {}  # Stores autotracked horizons: {horizon_id: tracking_results}
+        self.attribute_volumes = {}  # Cached attribute volumes
         
     def load_model(self):
         """Load the SAM2 model"""
@@ -211,6 +336,12 @@ class SeismicPredictor:
         self.seismic_volume = seismic_volume
         # Reset masks
         self.object_masks = {}
+
+        # Update autotracker with new volume
+        if self.autotracker and hasattr(self.autotracker, 'set_seismic_volume'):
+            self.autotracker.set_seismic_volume(seismic_volume)
+        elif self.autotracker:
+            self.autotracker.seismic_volume = seismic_volume
         
     def _normalize_slice(self, slice_data):
         """Normalize the slice data to 0-255 range for SAM2 input"""
@@ -1044,7 +1175,261 @@ class SeismicPredictor:
         # Set proper axis labels
         ax.set_xlabel('Trace Position')
         ax.set_ylabel('Time/Depth')
-        
+
         ax.set_title(f"{self.current_slice_type.capitalize()} {self.current_slice_idx} with Mask")
-        
-        return fig 
+
+        return fig
+
+    # ===== AUTOTRACKING METHODS =====
+
+    def auto_detect_horizon_seeds(self, slice_data: np.ndarray, slice_idx: int,
+                                 n_seeds: int = 10, method: str = 'from_points') -> List[Tuple[int, int]]:
+        """
+        Automatically detect seed points for horizon tracking using existing points and masks.
+
+        Args:
+            slice_data: 2D seismic slice
+            slice_idx: Index of the slice
+            n_seeds: Number of seed points to detect
+            method: Detection method ('from_points', 'from_masks', 'edge', 'amplitude', 'phase', 'hybrid')
+
+        Returns:
+            List of (x, y) seed point coordinates
+        """
+        if not self.autotracker:
+            print("Autotracking not available")
+            return []
+
+        # Get existing foreground points for current object
+        obj_id = getattr(self, '_current_object_id', 1)
+        existing_points = None
+        if hasattr(self, 'object_annotations') and obj_id in self.object_annotations:
+            points_data = self.object_annotations[obj_id]
+            if 'points' in points_data and points_data['points']:
+                existing_points = points_data['points']
+                print(f"Found {len(existing_points)} existing foreground points for Object {obj_id}")
+
+        # Get existing propagated masks
+        existing_masks = {}
+        for mask_obj_id in self.object_masks.keys():
+            slice_key = f"{getattr(self, '_current_slice_type', 'inline')}_{slice_idx}"
+            if slice_key in self.object_masks[mask_obj_id]:
+                existing_masks[mask_obj_id] = self.object_masks[mask_obj_id][slice_key]
+
+        if existing_masks:
+            print(f"Found existing masks for objects: {list(existing_masks.keys())}")
+
+        return self.autotracker.auto_detect_seeds(
+            slice_data, slice_idx, n_seeds, method,
+            existing_points=existing_points,
+            existing_masks=existing_masks
+        )
+
+    def track_horizon_automatically(self, start_slice_idx: int, seed_points: List[Tuple[int, int]],
+                                  direction: str = 'forward', max_slices: int = 50,
+                                  mode: str = 'hybrid', horizon_id: str = None) -> Dict:
+        """
+        Track a horizon automatically using seismic attributes and dynamic programming.
+        If existing masks are available, uses refined tracking to improve them.
+
+        Args:
+            start_slice_idx: Starting slice index
+            seed_points: List of (x, y) starting points
+            direction: 'forward' or 'backward'
+            max_slices: Maximum slices to track
+            mode: Tracking mode ('attribute_guided', 'edge_based', 'phase_guided', 'similarity_guided', 'hybrid')
+            horizon_id: Optional ID for the tracked horizon
+
+        Returns:
+            Tracking results dictionary
+        """
+        if not self.autotracker:
+            print("Autotracking not available")
+            return {}
+
+        # Convert string mode to enum
+        mode_map = {
+            'attribute_guided': TrackingMode.ATTRIBUTE_GUIDED,
+            'edge_based': TrackingMode.EDGE_BASED,
+            'phase_guided': TrackingMode.PHASE_GUIDED,
+            'similarity_guided': TrackingMode.SIMILARITY_GUIDED,
+            'hybrid': TrackingMode.HYBRID
+        }
+
+        tracking_mode = mode_map.get(mode, TrackingMode.HYBRID)
+
+        # Check if we have existing masks for this slice that we should refine
+        existing_mask = None
+        slice_key = f"{getattr(self, '_current_slice_type', 'inline')}_{start_slice_idx}"
+
+        # Look for existing masks from the current object
+        current_obj_id = getattr(self, '_current_object_id', 1)
+        if slice_key in self.object_masks.get(current_obj_id, {}):
+            existing_mask = self.object_masks[current_obj_id][slice_key]
+            print(f"Found existing mask for Object {current_obj_id} at slice {start_slice_idx}, will refine it")
+
+        # Choose tracking method based on available data
+        if existing_mask is not None and np.any(existing_mask):
+            # Use refined tracking to improve existing mask
+            results = self.autotracker.track_horizon_refined(
+                start_slice_idx, existing_mask, direction, max_slices, tracking_mode
+            )
+        else:
+            # Use regular tracking
+            results = self.autotracker.track_horizon_dp(
+                start_slice_idx, seed_points, direction, max_slices, tracking_mode
+            )
+
+        # Optionally refine with SAM
+        if not self.demo_mode and self.image_predictor:
+            results = self.autotracker.refine_tracking_with_sam(results, self)
+
+        # Store results
+        if horizon_id:
+            self.auto_tracked_horizons[horizon_id] = results
+
+        return results
+
+    def track_multiple_horizons(self, start_slice_idx: int, n_horizons: int = 3,
+                              direction: str = 'forward', max_slices: int = 50) -> Dict:
+        """
+        Automatically track multiple horizons simultaneously.
+
+        Args:
+            start_slice_idx: Starting slice index
+            n_horizons: Number of horizons to track
+            direction: 'forward' or 'backward'
+            max_slices: Maximum slices to track
+
+        Returns:
+            Results for all tracked horizons
+        """
+        if not self.autotracker:
+            print("Autotracking not available")
+            return {}
+
+        results = self.autotracker.track_multiple_horizons(
+            start_slice_idx, n_horizons, direction, max_slices
+        )
+
+        # Store results
+        for i, horizon_result in enumerate(results['horizons']):
+            horizon_id = f"auto_horizon_{start_slice_idx}_{i}"
+            self.auto_tracked_horizons[horizon_id] = horizon_result
+
+        return results
+
+    def compute_seismic_attributes(self, slice_data: np.ndarray = None,
+                                 attribute_types: List[str] = None) -> Dict[str, np.ndarray]:
+        """
+        Compute seismic attributes for the current slice or provided data.
+
+        Args:
+            slice_data: Optional slice data (uses current_slice if None)
+            attribute_types: List of attributes to compute
+
+        Returns:
+            Dictionary of computed attributes
+        """
+        if not self.attributes_processor:
+            print("Attributes processor not available - using basic amplitude")
+            if slice_data is None:
+                slice_data = self.current_slice
+            if slice_data is None:
+                return {}
+            # Fallback: just return amplitude
+            return {'amplitude': np.abs(slice_data)}
+
+        if slice_data is None:
+            slice_data = self.current_slice
+
+        if slice_data is None:
+            print("No slice data available")
+            return {}
+
+        try:
+            return self.attributes_processor.compute_slice_attributes(slice_data, attribute_types)
+        except Exception as e:
+            print(f"Error computing attributes: {e}, using basic amplitude")
+            return {'amplitude': np.abs(slice_data)}
+
+    def compute_volume_attributes(self, attribute_types: List[str] = None,
+                                slice_axis: int = 0) -> Dict[str, np.ndarray]:
+        """
+        Compute attributes for the entire seismic volume.
+
+        Args:
+            attribute_types: List of attributes to compute
+            slice_axis: Axis along which to slice (0=time/depth, 1=crossline, 2=inline)
+
+        Returns:
+            Dictionary of 3D attribute volumes
+        """
+        if not self.seismic_volume:
+            print("Volume not available")
+            return {}
+
+        if not self.attributes_processor:
+            print("Attributes processor not available - using basic amplitude")
+            # Fallback: just return amplitude volume
+            if attribute_types and 'amplitude' in attribute_types:
+                amplitude_vol = np.abs(self.seismic_volume)
+                return {'amplitude': amplitude_vol}
+            return {}
+
+        # Check cache first
+        cache_key = f"volume_{slice_axis}_{'_'.join(attribute_types or [])}"
+        if cache_key in self.attribute_volumes:
+            return self.attribute_volumes[cache_key]
+
+        try:
+            # Compute attributes
+            attributes = self.attributes_processor.compute_volume_attributes(
+                self.seismic_volume, attribute_types, slice_axis
+            )
+
+            # Cache results
+            self.attribute_volumes[cache_key] = attributes
+            return attributes
+        except Exception as e:
+            print(f"Error computing volume attributes: {e}, using basic amplitude")
+            # Fallback: just return amplitude volume
+            if attribute_types and 'amplitude' in attribute_types:
+                amplitude_vol = np.abs(self.seismic_volume)
+                return {'amplitude': amplitude_vol}
+            return {}
+
+    def get_autotracked_horizon(self, horizon_id: str) -> Optional[Dict]:
+        """Get autotracked horizon results by ID."""
+        return self.auto_tracked_horizons.get(horizon_id)
+
+    def get_all_autotracked_horizons(self) -> Dict[str, Dict]:
+        """Get all autotracked horizons."""
+        return self.auto_tracked_horizons.copy()
+
+    def clear_autotracking_cache(self):
+        """Clear autotracking results and caches."""
+        self.auto_tracked_horizons.clear()
+        if self.attributes_processor:
+            self.attributes_processor.clear_cache()
+        if self.autotracker:
+            self.autotracker._attribute_cache.clear()
+            self.autotracker._path_cache.clear()
+        self.attribute_volumes.clear()
+        print("Autotracking cache cleared")
+
+    def set_tracking_parameters(self, **params):
+        """Update autotracking parameters."""
+        if self.autotracker:
+            self.autotracker.set_tracking_parameters(**params)
+            print(f"Updated tracking parameters: {params}")
+        else:
+            print("Autotracker not available")
+
+    def get_tracking_quality_metrics(self, horizon_id: str) -> Dict[str, float]:
+        """Get quality metrics for a tracked horizon."""
+        horizon_data = self.get_autotracked_horizon(horizon_id)
+        if not horizon_data or not self.autotracker:
+            return {}
+
+        return self.autotracker.compute_tracking_quality(horizon_data) 

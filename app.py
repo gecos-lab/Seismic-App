@@ -38,6 +38,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from segy_loader import SegyLoader
 from seismic_predictor import SeismicPredictor
+from seismic_predictor_sam3 import SeismicPredictorSAM3
+
 
 # Import PyVista for 3D visualization
 try:
@@ -49,6 +51,7 @@ except ImportError:
     print("PyVista not available. 3D visualization will be disabled.")
 
 # Import LoopStructural for surface generation
+LOOPSTRUCTURAL_AVAILABLE = False
 try:
     # Try various import paths that might be used depending on installation method
     try:
@@ -77,14 +80,18 @@ class SeismicApp(QMainWindow):
     scale_updated = Signal(int)
     mask_ready = Signal(object)
     
-    def __init__(self, segy_path=None, demo_mode=False, model_id=None):
+    def __init__(self, segy_path=None, demo_mode=False, model_id=None, use_sam3=False):
         super().__init__()
-        self.setWindowTitle("Seismic Interpretation App")
+        self.setWindowTitle("Seismic Interpretation App" + (" (SAM3)" if use_sam3 else ""))
         self.setGeometry(100, 100, 1200, 800)
         
-        # Initialize the seismic predictor with SAM2 model
-        # Set demo_mode=False to use the real model when available
-        self.predictor = SeismicPredictor(demo_mode=demo_mode, model_id=model_id)
+        self.use_sam3 = use_sam3
+        
+        # Initialize the seismic predictor
+        if self.use_sam3:
+            self.predictor = SeismicPredictorSAM3(demo_mode=demo_mode)
+        else:
+            self.predictor = SeismicPredictor(demo_mode=demo_mode, model_id=model_id)
         
         # Try to load the real model (will fall back to demo mode if unavailable)
         success = self.predictor.load_model()
@@ -250,19 +257,38 @@ class SeismicApp(QMainWindow):
         
         # SAM2 menu
         sam2_menu = menubar.addMenu("SAM2")
-        
+
         clear_action = QAction("Clear Current Annotations", self)
         clear_action.triggered.connect(self._clear_annotations)
         sam2_menu.addAction(clear_action)
-        
+
         propagate_action = QAction("Propagate to All Slices", self)
         propagate_action.triggered.connect(self._propagate_to_all)
         sam2_menu.addAction(propagate_action)
-        
+
+        sam2_menu.addSeparator()
+
+        # Autotracking submenu
+        autotrack_menu = sam2_menu.addMenu("Autotracking")
+
+        auto_seed_action = QAction("Auto-Detect Seeds", self)
+        auto_seed_action.triggered.connect(self._auto_detect_seeds)
+        autotrack_menu.addAction(auto_seed_action)
+
+        track_horizon_action = QAction("Track Single Horizon", self)
+        track_horizon_action.triggered.connect(self._track_single_horizon)
+        autotrack_menu.addAction(track_horizon_action)
+
+        track_multiple_action = QAction("Track Multiple Horizons", self)
+        track_multiple_action.triggered.connect(self._track_multiple_horizons)
+        autotrack_menu.addAction(track_multiple_action)
+
+        sam2_menu.addSeparator()
+
         viz_3d_action = QAction("Open 3D Visualization", self)
         viz_3d_action.triggered.connect(self._open_3d_visualization)
         sam2_menu.addAction(viz_3d_action)
-        
+
         surface_3d_action = QAction("Generate 3D Surface", self)
         surface_3d_action.triggered.connect(self._open_3d_surface_generation)
         sam2_menu.addAction(surface_3d_action)
@@ -343,31 +369,60 @@ class SeismicApp(QMainWindow):
         # Action buttons
         action_widget = QWidget()
         action_layout = QHBoxLayout(action_widget)
-        
+
+        # Horizon mode checkbox
+        self.horizon_mode_checkbox = QCheckBox("Horizon Mode")
+        self.horizon_mode_checkbox.setChecked(True)  # Default to horizon mode
+        self.horizon_mode_checkbox.setToolTip("When enabled, generates thin horizon lines instead of filled masks")
+        self.horizon_mode_checkbox.stateChanged.connect(self._on_horizon_mode_change)
+        action_layout.addWidget(self.horizon_mode_checkbox)
+
+        action_layout.addWidget(QLabel("|"))  # Separator
+
         generate_btn = QPushButton("Generate Mask")
         generate_btn.clicked.connect(self._generate_mask)
         action_layout.addWidget(generate_btn)
-        
+
         clear_btn = QPushButton("Clear Points")
         clear_btn.clicked.connect(self._clear_annotations)
         action_layout.addWidget(clear_btn)
-        
+
         propagate_btn = QPushButton("Propagate")
         propagate_btn.clicked.connect(self._propagate_to_all)
         action_layout.addWidget(propagate_btn)
-        
+
+        action_layout.addWidget(QLabel("|"))  # Separator
+
+        # Autotracking buttons
+        auto_seed_btn = QPushButton("Auto Seeds")
+        auto_seed_btn.clicked.connect(self._auto_detect_seeds)
+        auto_seed_btn.setToolTip("Automatically detect seed points for horizon tracking")
+        action_layout.addWidget(auto_seed_btn)
+
+        track_single_btn = QPushButton("Track Horizon")
+        track_single_btn.clicked.connect(self._track_single_horizon)
+        track_single_btn.setToolTip("Track a single horizon automatically")
+        action_layout.addWidget(track_single_btn)
+
+        track_multi_btn = QPushButton("Track Multiple")
+        track_multi_btn.clicked.connect(self._track_multiple_horizons)
+        track_multi_btn.setToolTip("Track multiple horizons automatically")
+        action_layout.addWidget(track_multi_btn)
+
+        action_layout.addWidget(QLabel("|"))  # Separator
+
         viz_3d_btn = QPushButton("3D View")
         viz_3d_btn.clicked.connect(self._open_3d_visualization)
         action_layout.addWidget(viz_3d_btn)
-        
+
         surface_3d_btn = QPushButton("3D Surface")
         surface_3d_btn.clicked.connect(self._open_3d_surface_generation)
         action_layout.addWidget(surface_3d_btn)
-        
+
         save_3d_view_btn = QPushButton("Save 3D View...")
         save_3d_view_btn.clicked.connect(self._prompt_and_save_3d_view)
         action_layout.addWidget(save_3d_view_btn)
-        
+
         save_3d_surface_btn = QPushButton("Save 3D Surface...")
         save_3d_surface_btn.clicked.connect(self._prompt_and_save_3d_surface)
         action_layout.addWidget(save_3d_surface_btn)
@@ -414,6 +469,14 @@ class SeismicApp(QMainWindow):
         else:
             self._drawing_mode = "background"
     
+    def _on_horizon_mode_change(self, state):
+        """Handle horizon mode checkbox change"""
+        enabled = state == Qt.Checked.value if hasattr(Qt.Checked, 'value') else state == 2
+        if self.predictor and hasattr(self.predictor, 'set_horizon_mode'):
+            self.predictor.set_horizon_mode(enabled)
+        print(f"Horizon mode: {'enabled' if enabled else 'disabled'}")
+        self._update_display_with_points()
+
     def _connect_signals(self):
         """Connect Qt signals to slots"""
         # Canvas click events for annotations
@@ -454,6 +517,10 @@ class SeismicApp(QMainWindow):
         # Clean up resources
         if hasattr(self, 'segy_loader'):
             self.segy_loader.close()
+        
+        if hasattr(self, 'predictor') and hasattr(self.predictor, 'cleanup'):
+            self.predictor.cleanup()
+            
         event.accept()
     
     def _on_canvas_click(self, event):
@@ -482,11 +549,11 @@ class SeismicApp(QMainWindow):
             
         # Clear the axis
         self.ax.clear()
-        
+
         # Display the slice
         vmin, vmax = np.percentile(self.current_slice, [5, 95])
-        self.ax.imshow(self.current_slice, cmap='seismic', vmin=vmin, vmax=vmax, aspect='auto')
-        
+        self.ax.imshow(self.current_slice, cmap='gray', vmin=vmin, vmax=vmax, aspect='auto')
+
         # Get current object ID for highlighting
         current_obj_id = self.current_object_id.get()
         colors = plt.get_cmap('tab10').colors # Use consistent colors
@@ -520,8 +587,20 @@ class SeismicApp(QMainWindow):
                                 color=obj_color, marker='x', s=marker_size, alpha=alpha,
                                 label=f'Obj {obj_id} BG' if is_current else f'_Obj {obj_id} BG')
                                 
+        # Check for autotracked horizons in status
+        autotrack_status = ""
+        if self.predictor and hasattr(self.predictor, 'auto_tracked_horizons'):
+            n_autotracked = len(self.predictor.auto_tracked_horizons)
+            n_refined = sum(1 for h in self.predictor.auto_tracked_horizons.values() if h.get('refined', False))
+
+            if n_autotracked > 0:
+                if n_refined > 0:
+                    autotrack_status = f" | {n_refined} refined horizons"
+                else:
+                    autotrack_status = f" | {n_autotracked} autotracked horizons"
+
         # Update title - Indicate the *active* object ID
-        self.ax.set_title(f"{self.current_slice_type.get().capitalize()} {self.current_slice_idx.get()} (Active Object: {current_obj_id})")
+        self.ax.set_title(f"{self.current_slice_type.get().capitalize()} {self.current_slice_idx.get()} (Active Object: {current_obj_id}){autotrack_status}")
         self.ax.legend() # Show legend (only for current object due to underscore)
         
         # Redraw canvas
@@ -581,23 +660,26 @@ class SeismicApp(QMainWindow):
             self.queue.put(("progress", 0))
     
     def _load_model(self):
-        """Load the SAM2 model"""
-        self.status_text.set("Loading SAM2 model...")
+        """Load the SAM2/SAM3 model"""
+        model_name = "SAM3" if self.use_sam3 else "SAM2"
+        self.status_text.set(f"Loading {model_name} model...")
         self.progress_var.set(5)
         
         # Start loading in a thread
         threading.Thread(target=self._load_model_thread, daemon=True).start()
     
     def _load_model_thread(self):
-        """Thread function for loading the SAM2 model"""
+        """Thread function for loading the SAM2/SAM3 model"""
         try:
             success = self.predictor.load_model()
             
+            model_name = "SAM3" if self.use_sam3 else "SAM2"
+            
             if success:
-                self.queue.put(("status", "SAM2 model loaded successfully"))
+                self.queue.put(("status", f"{model_name} model loaded successfully"))
                 self.queue.put(("progress", 100))
             else:
-                self.queue.put(("error", "Failed to load SAM2 model"))
+                self.queue.put(("error", f"Failed to load {model_name} model"))
                 self.queue.put(("progress", 0))
                 
         except Exception as e:
@@ -750,29 +832,65 @@ class SeismicApp(QMainWindow):
             points, point_labels = self._get_current_annotations()
             obj_id = self.current_object_id.get()
             
-            # Predict masks
-            masks, scores, logits = self.predictor.predict_masks_from_points(
-                points, point_labels, multimask_output=True
-            )
+            # Check if horizon mode is enabled
+            horizon_mode = (hasattr(self, 'horizon_mode_checkbox') and 
+                           self.horizon_mode_checkbox.isChecked())
             
-            # Select the mask with highest score
-            best_mask_idx = np.argmax(scores)
-            best_mask = masks[best_mask_idx]
-            
-            # Store the generated mask for this object and slice (in predictor)
-            self.predictor.store_mask_for_object(
-                self.current_slice_type.get(), 
-                self.current_slice_idx.get(), 
-                obj_id, 
-                best_mask
-            )
-            
-            # Update UI in main thread
-            self.queue.put(("display_mask", best_mask))
-            self.queue.put(("status", f"Mask generated for Object {obj_id} with score: {scores[best_mask_idx]:.4f}"))
-            self.queue.put(("progress", 100))
+            if horizon_mode and hasattr(self.predictor, 'predict_horizon_from_points'):
+                # Use horizon interpretation mode for seismic horizons
+                self.queue.put(("status", f"Generating horizon for Object {obj_id}..."))
+                
+                best_mask, horizon_line, confidence = self.predictor.predict_horizon_from_points(
+                    points, point_labels, use_seismic_guidance=True
+                )
+                
+                # Store horizon line for later use
+                if hasattr(self.predictor, 'store_horizon_line'):
+                    self.predictor.store_horizon_line(
+                        obj_id,
+                        self.current_slice_type.get(),
+                        self.current_slice_idx.get(),
+                        horizon_line
+                    )
+                
+                # Store the generated mask for this object and slice (in predictor)
+                self.predictor.store_mask_for_object(
+                    self.current_slice_type.get(), 
+                    self.current_slice_idx.get(), 
+                    obj_id, 
+                    best_mask
+                )
+                
+                # Update UI in main thread
+                self.queue.put(("display_mask", best_mask))
+                self.queue.put(("status", f"Horizon generated for Object {obj_id} with {len(horizon_line)} points, confidence: {confidence:.4f}"))
+                self.queue.put(("progress", 100))
+            else:
+                # Standard SAM mask generation (blob mode)
+                masks, scores, logits = self.predictor.predict_masks_from_points(
+                    points, point_labels, multimask_output=True
+                )
+                
+                # Select the mask with highest score
+                best_mask_idx = np.argmax(scores)
+                best_mask = masks[best_mask_idx]
+                
+                # Store the generated mask for this object and slice (in predictor)
+                self.predictor.store_mask_for_object(
+                    self.current_slice_type.get(), 
+                    self.current_slice_idx.get(), 
+                    obj_id, 
+                    best_mask
+                )
+                
+                # Update UI in main thread
+                self.queue.put(("display_mask", best_mask))
+                self.queue.put(("status", f"Mask generated for Object {obj_id} with score: {scores[best_mask_idx]:.4f}"))
+                self.queue.put(("progress", 100))
                 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             self.queue.put(("error", f"Error generating mask for Object {self.current_object_id.get()}: {str(e)}"))
             self.queue.put(("progress", 0))
     
@@ -805,6 +923,33 @@ class SeismicApp(QMainWindow):
         # Start propagation in a thread
         threading.Thread(target=self._propagate_thread, daemon=True).start()
     
+    def _check_video_predictor_mode(self):
+        """Check if we should use real video predictor or demo mode.
+        
+        Returns:
+            bool: True if demo mode should be used, False for real video predictor
+        """
+        use_demo_mode = self.predictor.demo_mode
+        
+        if not use_demo_mode and not hasattr(self.predictor, 'video_predictor'):
+            print("Video predictor not initialized, falling back to demo mode")
+            return True
+            
+        if not use_demo_mode and self.predictor.video_predictor is not None:
+            vp_module = getattr(self.predictor.video_predictor, '__module__', '')
+            # Accept both SAM2 and SAM3 video predictors
+            if 'sam2' in vp_module or 'sam3' in vp_module:
+                print(f"Using real SAM video predictor: {vp_module}")
+                return False
+            else:
+                print(f"Video predictor module '{vp_module}' not recognized, falling back to demo mode")
+                return True
+        elif not use_demo_mode and self.predictor.video_predictor is None:
+            print("Video predictor is None, falling back to demo mode")
+            return True
+            
+        return use_demo_mode
+
     def _propagate_thread(self):
         """Thread function for mask propagation"""
         try:
@@ -837,20 +982,8 @@ class SeismicApp(QMainWindow):
             
             print(f"Slice type: {slice_type}, Current idx: {current_frame_idx}, Position: {current_frame_pos}, Object ID: {obj_id}")
             
-            # Force demo mode if video predictor failed to initialize properly
-            use_demo_mode = self.predictor.demo_mode
-            
-            # Check if we have a real video predictor or if we need to fall back to demo
-            if not use_demo_mode and not hasattr(self.predictor, 'video_predictor'):
-                print("Video predictor not initialized, falling back to demo mode")
-                use_demo_mode = True
-                
-            # Check if video predictor is a mock (has no __module__ attribute or it's not 'sam2.sam2_video_predictor')
-            if not use_demo_mode and (not hasattr(self.predictor.video_predictor, '__module__') or 
-                                     'sam2.sam2_video_predictor' not in self.predictor.video_predictor.__module__):
-                print("Video predictor is a mock, falling back to demo mode")
-                use_demo_mode = True
-                
+            # Check if we should use demo mode or real video predictor
+            use_demo_mode = self._check_video_predictor_mode()
             print(f"Using {'demo' if use_demo_mode else 'real'} mode for propagation")
             
             # Use the full range of slices, regardless of demo or real mode
@@ -965,18 +1098,21 @@ class SeismicApp(QMainWindow):
             self.queue.put(("progress", 0))
     
     def display_mask(self, mask_for_current_obj):
-        """Display the slice with masks for ALL relevant objects overlaid."""
+        """Display the slice with masks for ALL relevant objects overlaid.
+        
+        In horizon mode, displays thin lines instead of filled masks.
+        """
         if not hasattr(self, 'current_slice') or self.current_slice is None:
             print("Warning: display_mask called without a current slice.")
             return
             
         # Clear the axis
         self.ax.clear()
-        
+
         # Display the slice
         vmin, vmax = np.percentile(self.current_slice, [5, 95])
-        self.ax.imshow(self.current_slice, cmap='seismic', vmin=vmin, vmax=vmax, aspect='auto')
-        
+        self.ax.imshow(self.current_slice, cmap='gray', vmin=vmin, vmax=vmax, aspect='auto')
+
         # Get current slice info
         slice_type = self.current_slice_type.get()
         slice_idx = self.current_slice_idx.get()
@@ -985,6 +1121,10 @@ class SeismicApp(QMainWindow):
         
         current_obj_id = self.current_object_id.get()
         colors = plt.get_cmap('tab10').colors
+        
+        # Check if horizon mode is enabled
+        horizon_mode = (hasattr(self, 'horizon_mode_checkbox') and 
+                       self.horizon_mode_checkbox.isChecked())
         
         # --- Display masks for ALL objects that might have one ---
         # Combine known object IDs from annotations and predictor states
@@ -999,12 +1139,20 @@ class SeismicApp(QMainWindow):
 
         for obj_id in sorted(list(all_known_obj_ids)):
             mask_to_display = None
+            horizon_line = None
             is_current = (obj_id == current_obj_id)
             
             # If this is the current object, use the mask passed to the function
             if is_current and mask_for_current_obj is not None:
                 mask_to_display = mask_for_current_obj
                 print(f"Using provided mask for current Object {obj_id}")
+                
+                # Try to get horizon line if in horizon mode
+                if horizon_mode and hasattr(self.predictor, 'get_horizon_line'):
+                    horizon_line = self.predictor.get_horizon_line(obj_id, slice_type, slice_idx)
+                    # If no stored horizon line, extract from the mask
+                    if horizon_line is None and hasattr(self.predictor, 'mask_to_horizon_line'):
+                        horizon_line = self.predictor.mask_to_horizon_line(mask_for_current_obj)
             else:
                 # Otherwise, try to fetch the mask from the predictor
                 try:
@@ -1015,6 +1163,15 @@ class SeismicApp(QMainWindow):
                     if fetched_mask is not None and np.any(fetched_mask):
                          mask_to_display = fetched_mask
                          print(f"Fetched mask for Object {obj_id} on frame {frame_pos}")
+                         
+                         # Try to get or extract horizon line in horizon mode
+                         if horizon_mode:
+                             if hasattr(self.predictor, 'get_horizon_line'):
+                                 horizon_line = self.predictor.get_horizon_line(obj_id, slice_type, slice_idx)
+                             # Always extract from mask if no stored line found
+                             if horizon_line is None and hasattr(self.predictor, 'mask_to_horizon_line'):
+                                 horizon_line = self.predictor.mask_to_horizon_line(fetched_mask)
+                                 print(f"Extracted horizon line from mask: {len(horizon_line) if horizon_line else 0} points")
                     # else:
                     #     print(f"No mask found for Object {obj_id} on frame {frame_pos}")
 
@@ -1027,13 +1184,27 @@ class SeismicApp(QMainWindow):
                      print(f"Warning: Mask shape {mask_to_display.shape} mismatch for Object {obj_id} on slice {self.current_slice.shape}. Skipping.")
                      continue # Skip overlay if shapes don't match
 
-                 mask_overlay = np.zeros((*mask_to_display.shape, 4))
                  obj_color = colors[ (obj_id - 1) % len(colors) ]
-                 alpha = 0.6 if is_current else 0.4 # Current slightly more opaque
                  
-                 mask_overlay[mask_to_display > 0] = [*obj_color, alpha]
-                 self.ax.imshow(mask_overlay, aspect='auto')
-                 print(f"Overlayed mask for Object {obj_id} with color {obj_color} alpha {alpha}")
+                 if horizon_mode and horizon_line and len(horizon_line) > 1:
+                     # Horizon mode: Draw as a line instead of filled mask
+                     line_pts = np.array(horizon_line)
+                     linewidth = 3 if is_current else 2
+                     alpha = 1.0 if is_current else 0.8
+                     
+                     # Plot the horizon line
+                     self.ax.plot(line_pts[:, 0], line_pts[:, 1], 
+                                 color=obj_color, linewidth=linewidth, alpha=alpha,
+                                 label=f'Horizon {obj_id}' if is_current else f'_Horizon {obj_id}')
+                     print(f"Drew horizon line for Object {obj_id} with {len(horizon_line)} points")
+                 else:
+                     # Standard mask overlay mode (or no horizon line available)
+                     mask_overlay = np.zeros((*mask_to_display.shape, 4))
+                     alpha = 0.6 if is_current else 0.4 # Current slightly more opaque
+                     
+                     mask_overlay[mask_to_display > 0] = [*obj_color, alpha]
+                     self.ax.imshow(mask_overlay, aspect='auto')
+                     print(f"Overlayed mask for Object {obj_id} with color {obj_color} alpha {alpha}")
 
 
         # --- Plot points for ALL objects ---
@@ -1060,8 +1231,26 @@ class SeismicApp(QMainWindow):
                  self.ax.scatter(bg_points[:, 0], bg_points[:, 1], color=obj_color, marker='x', 
                                  s=marker_size, alpha=alpha, label=f'Obj {obj_id} BG' if is_current else f'_Obj {obj_id} BG')
 
-        # Update title
-        self.ax.set_title(f"{slice_type.capitalize()} {slice_idx} (Active Object: {current_obj_id}) with Masks")
+        # Check if autotracked horizons are displayed
+        autotrack_info = ""
+        if self.predictor and hasattr(self.predictor, 'auto_tracked_horizons'):
+            visible_horizons = []
+            refined_count = 0
+
+            for hid, hdata in self.predictor.auto_tracked_horizons.items():
+                if hid in all_known_obj_ids:
+                    visible_horizons.append(hid)
+                    if hdata.get('refined', False):
+                        refined_count += 1
+
+            if visible_horizons:
+                if refined_count > 0:
+                    autotrack_info = f" | Refined: {refined_count} horizons"
+                else:
+                    autotrack_info = f" | Autotracked: {len(visible_horizons)} horizons"
+
+        # Update title with autotracking info
+        self.ax.set_title(f"{slice_type.capitalize()} {slice_idx} (Active Object: {current_obj_id}){autotrack_info}")
         self.ax.legend() # Show legend
         
         # Redraw canvas
@@ -1088,6 +1277,8 @@ class SeismicApp(QMainWindow):
                     self._load_current_slice()
                 elif cmd == "display_mask":
                     self.display_mask(msg[1])
+                elif cmd == "update_display_with_points":
+                    self._update_display_with_points()
                     
                 self.queue.task_done()
         except queue.Empty:
@@ -1256,19 +1447,8 @@ class SeismicApp(QMainWindow):
             print(f"Slice type: {slice_type}, Current idx: {current_frame_idx}, Position: {current_frame_pos}, Object ID: {obj_id}")
             
             # Force demo mode if video predictor failed to initialize properly
-            use_demo_mode = self.predictor.demo_mode
-            
-            # Check if we have a real video predictor or if we need to fall back to demo
-            if not use_demo_mode and not hasattr(self.predictor, 'video_predictor'):
-                print("Video predictor not initialized, falling back to demo mode")
-                use_demo_mode = True
-                
-            # Check if video predictor is a mock (has no __module__ attribute or it's not 'sam2.sam2_video_predictor')
-            if not use_demo_mode and (not hasattr(self.predictor.video_predictor, '__module__') or 
-                                     'sam2.sam2_video_predictor' not in self.predictor.video_predictor.__module__):
-                print("Video predictor is a mock, falling back to demo mode")
-                use_demo_mode = True
-                
+            # Check if we should use demo mode or real video predictor
+            use_demo_mode = self._check_video_predictor_mode()
             print(f"Using {'demo' if use_demo_mode else 'real'} mode for propagation")
             
             # Use the full range of slices, regardless of demo or real mode
@@ -2623,7 +2803,209 @@ class SeismicApp(QMainWindow):
             self.queue.put(("error", f"Error saving 3D surface: {str(e)}\n\n{trace}"))
             self.queue.put(("progress", 0))
             if 'plotter' in locals() and plotter: plotter.close()
-            
+
+    # ===== AUTOTRACKING METHODS =====
+
+    def _auto_detect_seeds(self):
+        """Automatically detect seed points for horizon tracking."""
+        if not hasattr(self.segy_loader, 'data') or self.segy_loader.data is None:
+            QMessageBox.information(self, "Info", "Please load a SEGY file first.")
+            return
+
+        if not hasattr(self, 'current_slice') or self.current_slice is None:
+            QMessageBox.information(self, "Info", "Please select a slice first.")
+            return
+
+        # Ask user for detection method
+        methods = ["from_points", "from_masks", "hybrid", "edge", "amplitude", "phase"]
+        method, ok = QInputDialog.getItem(self, "Seed Detection Method",
+                                        "Choose detection method:", methods, 0, False)
+
+        if not ok:
+            return
+
+        # Ask for number of seeds
+        n_seeds, ok = QInputDialog.getInt(self, "Number of Seeds",
+                                        "Number of seed points to detect:", 10, 1, 50)
+
+        if not ok:
+            return
+
+        self.status_text.set(f"Auto-detecting {n_seeds} seed points using {method} method...")
+        self.progress_var.set(20)
+
+        # Start seed detection in thread
+        threading.Thread(target=self._auto_detect_seeds_thread,
+                        args=(method, n_seeds), daemon=True).start()
+
+    def _auto_detect_seeds_thread(self, method, n_seeds):
+        """Thread function for seed detection."""
+        try:
+            # Detect seeds
+            seeds = self.predictor.auto_detect_horizon_seeds(
+                self.current_slice, self.current_slice_idx, n_seeds, method
+            )
+
+            # Add detected seeds as annotations for current object
+            obj_id = self.current_object_id.get()
+            if obj_id not in self.object_annotations:
+                self.object_annotations[obj_id] = {'points': [], 'labels': []}
+
+            # Add seeds as foreground points
+            for seed in seeds:
+                self.object_annotations[obj_id]['points'].append(list(seed))
+                self.object_annotations[obj_id]['labels'].append(1)  # Foreground
+
+            # Update display
+            self.queue.put(("update_display_with_points", None))
+            self.queue.put(("status", f"Auto-seed detection complete: {len(seeds)} seeds detected using '{method}' method"))
+            self.queue.put(("progress", 100))
+
+        except Exception as e:
+            self.queue.put(("error", f"Error detecting seeds: {str(e)}"))
+            self.queue.put(("progress", 0))
+
+    def _track_single_horizon(self):
+        """Track a single horizon automatically."""
+        if not hasattr(self.segy_loader, 'data') or self.segy_loader.data is None:
+            QMessageBox.information(self, "Info", "Please load a SEGY file first.")
+            return
+
+        obj_id = self.current_object_id.get()
+        if obj_id not in self.object_annotations or not self.object_annotations[obj_id]['points']:
+            QMessageBox.information(self, "Info", "Please add seed points first (or use Auto Seeds).")
+            return
+
+        # Get tracking parameters
+        directions = ["forward", "backward", "both"]
+        direction, ok = QInputDialog.getItem(self, "Tracking Direction",
+                                           "Choose tracking direction:", directions, 0, False)
+
+        if not ok:
+            return
+
+        max_slices, ok = QInputDialog.getInt(self, "Maximum Slices",
+                                           "Maximum slices to track:", 50, 5, 200)
+
+        if not ok:
+            return
+
+        modes = ["hybrid", "attribute_guided", "edge_based", "phase_guided", "similarity_guided"]
+        mode, ok = QInputDialog.getItem(self, "Tracking Mode",
+                                      "Choose tracking mode:", modes, 0, False)
+
+        if not ok:
+            return
+
+        self.status_text.set(f"Tracking horizon for Object {obj_id} ({direction}, {mode})...")
+        self.progress_var.set(10)
+
+        # Start tracking in thread
+        threading.Thread(target=self._track_single_horizon_thread,
+                        args=(obj_id, direction, max_slices, mode), daemon=True).start()
+
+    def _track_single_horizon_thread(self, obj_id, direction, max_slices, mode):
+        """Thread function for single horizon tracking."""
+        try:
+            # Get seed points for current object
+            points = self.object_annotations[obj_id]['points']
+
+            # Track in one direction first
+            directions_to_track = [direction] if direction != "both" else ["forward", "backward"]
+
+            all_results = {}
+
+            for track_direction in directions_to_track:
+                horizon_id = f"horizon_{obj_id}_{track_direction}"
+                results = self.predictor.track_horizon_automatically(
+                    self.current_slice_idx, points, track_direction, max_slices, mode, horizon_id
+                )
+                all_results[track_direction] = results
+
+            # Display results
+            if all_results:
+                # Show results for the primary direction
+                primary_results = all_results[directions_to_track[0]]
+                if 'paths' in primary_results and primary_results['paths']:
+                    n_paths = len(primary_results['paths'])
+                    avg_confidence = np.mean([np.mean(confs) for confs in primary_results['confidences'].values()])
+
+                    # Check if this was a refinement of existing masks
+                    was_refined = primary_results.get('refined', False)
+                    if was_refined:
+                        status_msg = f"Horizon refinement complete: Improved existing mask with {n_paths} refined paths (avg confidence: {avg_confidence:.2f})"
+                    else:
+                        status_msg = f"Autotracking complete: {n_paths} new horizons tracked (avg confidence: {avg_confidence:.2f})"
+
+                    self.queue.put(("display_mask", None))  # Trigger display update
+                    self.queue.put(("status", status_msg))
+                else:
+                    self.queue.put(("status", "Autotracking: No valid paths found"))
+            else:
+                self.queue.put(("status", "Autotracking failed - no results"))
+
+            self.queue.put(("progress", 100))
+
+        except Exception as e:
+            import traceback
+            trace = traceback.format_exc()
+            self.queue.put(("error", f"Error tracking horizon: {str(e)}\n\n{trace}"))
+            self.queue.put(("progress", 0))
+
+    def _track_multiple_horizons(self):
+        """Track multiple horizons automatically."""
+        if not hasattr(self.segy_loader, 'data') or self.segy_loader.data is None:
+            QMessageBox.information(self, "Info", "Please load a SEGY file first.")
+            return
+
+        # Get parameters
+        n_horizons, ok = QInputDialog.getInt(self, "Number of Horizons",
+                                           "Number of horizons to track:", 3, 1, 10)
+
+        if not ok:
+            return
+
+        directions = ["forward", "backward"]
+        direction, ok = QInputDialog.getItem(self, "Tracking Direction",
+                                           "Choose tracking direction:", directions, 0, False)
+
+        if not ok:
+            return
+
+        max_slices, ok = QInputDialog.getInt(self, "Maximum Slices",
+                                           "Maximum slices to track:", 50, 5, 200)
+
+        if not ok:
+            return
+
+        self.status_text.set(f"Tracking {n_horizons} horizons ({direction})...")
+        self.progress_var.set(10)
+
+        # Start tracking in thread
+        threading.Thread(target=self._track_multiple_horizons_thread,
+                        args=(n_horizons, direction, max_slices), daemon=True).start()
+
+    def _track_multiple_horizons_thread(self, n_horizons, direction, max_slices):
+        """Thread function for multiple horizon tracking."""
+        try:
+            # Track multiple horizons
+            results = self.predictor.track_multiple_horizons(
+                self.current_slice_idx, n_horizons, direction, max_slices
+            )
+
+            n_tracked = results.get('n_tracked', 0)
+
+            # Update display to show tracked horizons
+            self.queue.put(("display_mask", None))
+            self.queue.put(("status", f"Multi-horizon autotracking complete: {n_tracked} horizons tracked"))
+            self.queue.put(("progress", 100))
+
+        except Exception as e:
+            import traceback
+            trace = traceback.format_exc()
+            self.queue.put(("error", f"Error tracking multiple horizons: {str(e)}\n\n{trace}"))
+            self.queue.put(("progress", 0))
+
 
 def main():
     # Parse command line arguments
@@ -2631,6 +3013,7 @@ def main():
     parser.add_argument("--demo", action="store_true", help="Run in demo mode without loading the SAM2 model")
     parser.add_argument("--model", choices=["base-plus", "large", "small", "tiny", "2.1-base-plus", "2.1-large"], 
                         default="base-plus", help="SAM2 model size to use")
+    parser.add_argument("--sam3", action="store_true", help="Use SAM3 model (requires sam3 package)")
     args = parser.parse_args()
     
     # Set demo mode based on command line arguments
@@ -2641,6 +3024,8 @@ def main():
     
     if demo_mode:
         print("Starting in demo mode (no model will be loaded)")
+    elif args.sam3:
+        print("Starting with SAM3 model")
     else:
         print(f"Starting with SAM2 model: {model_id}")
     
@@ -2658,7 +3043,7 @@ def main():
         app.setOrganizationName("Seismic Analysis")
         
         # Create the main window
-        window = SeismicApp(demo_mode=demo_mode, model_id=model_id)
+        window = SeismicApp(demo_mode=demo_mode, model_id=model_id, use_sam3=args.sam3)
         window.show()
         
         # Start the event loop
@@ -2673,7 +3058,7 @@ def main():
         try:
             print("Trying without high DPI scaling...")
             app = QApplication(sys.argv)
-            window = SeismicApp(demo_mode=demo_mode, model_id=model_id)
+            window = SeismicApp(demo_mode=demo_mode, model_id=model_id, use_sam3=args.sam3)
             window.show()
             sys.exit(app.exec())
         except Exception as e2:
