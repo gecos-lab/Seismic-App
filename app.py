@@ -409,7 +409,16 @@ class SeismicApp(QMainWindow):
         track_multi_btn.setToolTip("Track multiple horizons automatically")
         action_layout.addWidget(track_multi_btn)
 
-        action_layout.addWidget(QLabel("|"))  # Separator
+        action_layout.addWidget(QLabel("|"))  # Separator - Fault Detection
+
+        # Fault mode checkbox - when enabled, Generate Mask creates fault line instead of horizon
+        self.fault_mode_checkbox = QCheckBox("Fault Mode")
+        self.fault_mode_checkbox.setChecked(False)
+        self.fault_mode_checkbox.setToolTip("When enabled, Generate Mask creates a vertical/diagonal fault line instead of horizontal horizon")
+        self.fault_mode_checkbox.stateChanged.connect(self._on_fault_mode_change)
+        action_layout.addWidget(self.fault_mode_checkbox)
+
+        action_layout.addWidget(QLabel("|"))  # Separator - 3D
 
         viz_3d_btn = QPushButton("3D View")
         viz_3d_btn.clicked.connect(self._open_3d_visualization)
@@ -474,8 +483,21 @@ class SeismicApp(QMainWindow):
         enabled = state == Qt.Checked.value if hasattr(Qt.Checked, 'value') else state == 2
         if self.predictor and hasattr(self.predictor, 'set_horizon_mode'):
             self.predictor.set_horizon_mode(enabled)
+        # Uncheck fault mode when horizon mode is enabled
+        if enabled and hasattr(self, 'fault_mode_checkbox'):
+            self.fault_mode_checkbox.setChecked(False)
         print(f"Horizon mode: {'enabled' if enabled else 'disabled'}")
         self._update_display_with_points()
+    
+    def _on_fault_mode_change(self, state):
+        """Handle fault mode checkbox change"""
+        enabled = state == Qt.Checked.value if hasattr(Qt.Checked, 'value') else state == 2
+        if self.predictor and hasattr(self.predictor, 'set_fault_mode'):
+            self.predictor.set_fault_mode(enabled)
+        # Uncheck horizon mode when fault mode is enabled
+        if enabled and hasattr(self, 'horizon_mode_checkbox'):
+            self.horizon_mode_checkbox.setChecked(False)
+        print(f"Fault mode: {'enabled' if enabled else 'disabled'}")
 
     def _connect_signals(self):
         """Connect Qt signals to slots"""
@@ -832,25 +854,28 @@ class SeismicApp(QMainWindow):
             points, point_labels = self._get_current_annotations()
             obj_id = self.current_object_id.get()
             
-            # Check if horizon mode is enabled
+            # Check if horizon mode OR fault mode is enabled
             horizon_mode = (hasattr(self, 'horizon_mode_checkbox') and 
                            self.horizon_mode_checkbox.isChecked())
+            fault_mode = (hasattr(self, 'fault_mode_checkbox') and
+                         self.fault_mode_checkbox.isChecked())
             
-            if horizon_mode and hasattr(self.predictor, 'predict_horizon_from_points'):
-                # Use horizon interpretation mode for seismic horizons
-                self.queue.put(("status", f"Generating horizon for Object {obj_id}..."))
+            # Use line-based generation for both horizon and fault modes
+            if (horizon_mode or fault_mode) and hasattr(self.predictor, 'predict_horizon_from_points'):
+                mode_name = "fault" if fault_mode else "horizon"
+                self.queue.put(("status", f"Generating {mode_name} for Object {obj_id}..."))
                 
-                best_mask, horizon_line, confidence = self.predictor.predict_horizon_from_points(
+                best_mask, line_points, confidence = self.predictor.predict_horizon_from_points(
                     points, point_labels, use_seismic_guidance=True
                 )
                 
-                # Store horizon line for later use
+                # Store line for later use
                 if hasattr(self.predictor, 'store_horizon_line'):
                     self.predictor.store_horizon_line(
                         obj_id,
                         self.current_slice_type.get(),
                         self.current_slice_idx.get(),
-                        horizon_line
+                        line_points
                     )
                 
                 # Store the generated mask for this object and slice (in predictor)
@@ -863,7 +888,7 @@ class SeismicApp(QMainWindow):
                 
                 # Update UI in main thread
                 self.queue.put(("display_mask", best_mask))
-                self.queue.put(("status", f"Horizon generated for Object {obj_id} with {len(horizon_line)} points, confidence: {confidence:.4f}"))
+                self.queue.put(("status", f"{mode_name.capitalize()} generated for Object {obj_id} with {len(line_points)} points, confidence: {confidence:.4f}"))
                 self.queue.put(("progress", 100))
             else:
                 # Standard SAM mask generation (blob mode)
@@ -1122,9 +1147,12 @@ class SeismicApp(QMainWindow):
         current_obj_id = self.current_object_id.get()
         colors = plt.get_cmap('tab10').colors
         
-        # Check if horizon mode is enabled
+        # Check if horizon mode OR fault mode is enabled (both draw lines)
         horizon_mode = (hasattr(self, 'horizon_mode_checkbox') and 
                        self.horizon_mode_checkbox.isChecked())
+        fault_mode = (hasattr(self, 'fault_mode_checkbox') and
+                     self.fault_mode_checkbox.isChecked())
+        line_mode = horizon_mode or fault_mode  # Either mode draws lines
         
         # --- Display masks for ALL objects that might have one ---
         # Combine known object IDs from annotations and predictor states
@@ -1142,17 +1170,25 @@ class SeismicApp(QMainWindow):
             horizon_line = None
             is_current = (obj_id == current_obj_id)
             
+            # Check if this specific object is a fault (stored in predictor)
+            is_fault_obj = False
+            if self.predictor and hasattr(self.predictor, 'fault_objects'):
+                is_fault_obj = self.predictor.fault_objects.get(obj_id, False)
+            
             # If this is the current object, use the mask passed to the function
             if is_current and mask_for_current_obj is not None:
                 mask_to_display = mask_for_current_obj
                 print(f"Using provided mask for current Object {obj_id}")
                 
-                # Try to get horizon line if in horizon mode
-                if horizon_mode and hasattr(self.predictor, 'get_horizon_line'):
+                # Try to get line if in line mode (horizon or fault)
+                if line_mode and hasattr(self.predictor, 'get_horizon_line'):
                     horizon_line = self.predictor.get_horizon_line(obj_id, slice_type, slice_idx)
-                    # If no stored horizon line, extract from the mask
+                    # If no stored line, extract from the mask
                     if horizon_line is None and hasattr(self.predictor, 'mask_to_horizon_line'):
-                        horizon_line = self.predictor.mask_to_horizon_line(mask_for_current_obj)
+                        if is_fault_obj and hasattr(self.predictor, '_extract_fault_from_mask'):
+                            horizon_line = self.predictor._extract_fault_from_mask(mask_for_current_obj)
+                        else:
+                            horizon_line = self.predictor.mask_to_horizon_line(mask_for_current_obj)
             else:
                 # Otherwise, try to fetch the mask from the predictor
                 try:
@@ -1164,14 +1200,17 @@ class SeismicApp(QMainWindow):
                          mask_to_display = fetched_mask
                          print(f"Fetched mask for Object {obj_id} on frame {frame_pos}")
                          
-                         # Try to get or extract horizon line in horizon mode
-                         if horizon_mode:
+                         # Try to get or extract line in line mode (horizon or fault)
+                         if line_mode:
                              if hasattr(self.predictor, 'get_horizon_line'):
                                  horizon_line = self.predictor.get_horizon_line(obj_id, slice_type, slice_idx)
                              # Always extract from mask if no stored line found
                              if horizon_line is None and hasattr(self.predictor, 'mask_to_horizon_line'):
-                                 horizon_line = self.predictor.mask_to_horizon_line(fetched_mask)
-                                 print(f"Extracted horizon line from mask: {len(horizon_line) if horizon_line else 0} points")
+                                 if is_fault_obj and hasattr(self.predictor, '_extract_fault_from_mask'):
+                                     horizon_line = self.predictor._extract_fault_from_mask(fetched_mask)
+                                 else:
+                                     horizon_line = self.predictor.mask_to_horizon_line(fetched_mask)
+                                 print(f"Extracted {'fault' if is_fault_obj else 'horizon'} line from mask: {len(horizon_line) if horizon_line else 0} points")
                     # else:
                     #     print(f"No mask found for Object {obj_id} on frame {frame_pos}")
 
@@ -1186,19 +1225,20 @@ class SeismicApp(QMainWindow):
 
                  obj_color = colors[ (obj_id - 1) % len(colors) ]
                  
-                 if horizon_mode and horizon_line and len(horizon_line) > 1:
-                     # Horizon mode: Draw as a line instead of filled mask
+                 if line_mode and horizon_line and len(horizon_line) > 1:
+                     # Line mode: Draw as a line instead of filled mask (for both horizon and fault)
                      line_pts = np.array(horizon_line)
                      linewidth = 3 if is_current else 2
                      alpha = 1.0 if is_current else 0.8
                      
-                     # Plot the horizon line
+                     # Plot the line
+                     line_label = f'Fault {obj_id}' if is_fault_obj else f'Horizon {obj_id}'
                      self.ax.plot(line_pts[:, 0], line_pts[:, 1], 
                                  color=obj_color, linewidth=linewidth, alpha=alpha,
-                                 label=f'Horizon {obj_id}' if is_current else f'_Horizon {obj_id}')
-                     print(f"Drew horizon line for Object {obj_id} with {len(horizon_line)} points")
+                                 label=line_label if is_current else f'_{line_label}')
+                     print(f"Drew {'fault' if is_fault_obj else 'horizon'} line for Object {obj_id} with {len(horizon_line)} points")
                  else:
-                     # Standard mask overlay mode (or no horizon line available)
+                     # Standard mask overlay mode (or no line available)
                      mask_overlay = np.zeros((*mask_to_display.shape, 4))
                      alpha = 0.6 if is_current else 0.4 # Current slightly more opaque
                      

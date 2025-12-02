@@ -156,12 +156,34 @@ class SeismicPredictorSAM3:
         self.autotracker = None
         self.auto_tracked_horizons = {}
         
+        # Fault detection storage
+        self.fault_mode = False  # Fault picking mode
+        self.fault_objects = {}  # {obj_id: True/False} - Track which objects are faults
+        self.detected_faults = {}  # {slice_key: {'lines': [...], 'likelihood': array, 'mask': array}}
+        self.fault_picks = {}  # {fault_id: {slice_key: [(x,y), ...]}} - User-picked faults
+        self.current_fault_id = 1
+        self.show_faults = False  # Whether to display faults overlay
+        
         self._init_autotracker()
 
     def set_horizon_mode(self, enabled: bool):
         """Enable or disable horizon interpretation mode."""
         self.horizon_mode = enabled
-        print(f"Horizon mode: {'enabled' if enabled else 'disabled'}")
+        if enabled:
+            self.fault_mode = False  # Only disable fault mode when enabling horizon mode
+        print(f"Horizon mode: {'enabled' if enabled else 'disabled'}, fault_mode is now: {self.fault_mode}")
+    
+    def set_fault_mode(self, enabled: bool):
+        """Enable or disable fault picking mode."""
+        self.fault_mode = enabled
+        if enabled:
+            self.horizon_mode = False  # Disable horizon mode when fault mode is enabled
+        print(f"Fault mode: {'enabled' if enabled else 'disabled'}, fault_mode is now: {self.fault_mode}")
+    
+    def toggle_fault_display(self, show: bool):
+        """Toggle fault overlay display."""
+        self.show_faults = show
+        print(f"Fault display: {'on' if show else 'off'}")
 
     def _init_autotracker(self):
         if AUTOTRACKING_AVAILABLE:
@@ -364,66 +386,218 @@ class SeismicPredictorSAM3:
         num = max(abs(r1 - r0), abs(c1 - c0)) + 1
         return np.linspace(r0, r1, num).astype(int), np.linspace(c0, c1, num).astype(int)
 
-    # ===================== HORIZON INTERPRETATION METHODS =====================
+    # ===================== HORIZON/FAULT INTERPRETATION METHODS =====================
     
     def predict_horizon_from_points(self, points: List[Tuple[float, float]], 
                                    point_labels: List[int],
                                    use_seismic_guidance: bool = True) -> Tuple[np.ndarray, List[Tuple[int, int]], float]:
         """
-        Predict a seismic horizon line from input points.
+        Predict a seismic horizon line OR fault line from input points.
         
-        Unlike standard SAM segmentation that produces blobs, this method:
-        1. Uses SAM3 to understand the seismic context around points
-        2. Fits a smooth horizon line through the foreground points
-        3. Uses seismic attributes (edges, phase) to refine the path
+        When fault_mode is enabled:
+        - Creates a vertical/diagonal fault line through the points
+        - Interpolates along Y-axis (vertical) instead of X-axis (horizontal)
+        
+        When horizon_mode (default):
+        - Creates a horizontal horizon line through the points
+        - Interpolates along X-axis
         
         Args:
             points: List of (x, y) point coordinates
-            point_labels: List of labels (1=foreground on horizon, 0=background)
+            point_labels: List of labels (1=foreground, 0=background)
             use_seismic_guidance: Whether to use seismic attributes for guidance
             
         Returns:
-            Tuple of (horizon_mask, horizon_line_points, confidence)
+            Tuple of (mask, line_points, confidence)
         """
         if self.current_slice is None:
             raise ValueError("No slice data set")
             
         h, w = self.current_slice.shape
         
-        # Get foreground points (horizon picks)
+        # Get foreground points
         fg_points = [(p[0], p[1]) for i, p in enumerate(points) if point_labels[i] == 1]
         
         if len(fg_points) < 2:
             # Not enough points for a line - use SAM3 blob and extract centerline
             masks, scores, logits = self.predict_masks_from_points(points, point_labels)
             best_mask = masks[np.argmax(scores)]
-            horizon_line = self._extract_horizon_from_mask(best_mask)
-            horizon_mask = self._create_line_mask(horizon_line, h, w)
-            return horizon_mask, horizon_line, float(np.max(scores))
+            if self.fault_mode:
+                line = self._extract_fault_from_mask(best_mask)
+            else:
+                line = self._extract_horizon_from_mask(best_mask)
+            mask = self._create_line_mask(line, h, w)
+            return mask, line, float(np.max(scores))
         
-        # Sort points by x-coordinate for proper horizon interpolation
-        fg_points.sort(key=lambda p: p[0])
-        
-        print(f"Horizon from {len(fg_points)} points: {fg_points}")
-        
-        # Fit a smooth spline through the points
-        if use_seismic_guidance and self.attributes_processor is not None:
-            # Use seismic-guided interpolation
-            horizon_line = self._seismic_guided_interpolation(fg_points, self.current_slice)
+        # Check if we're in fault mode
+        if self.fault_mode:
+            print(f"FAULT MODE: Creating fault from {len(fg_points)} points")
+            # Sort points by y-coordinate (faults go top to bottom)
+            fg_points.sort(key=lambda p: p[1])
+            
+            # Use fault-specific interpolation
+            if use_seismic_guidance and self.attributes_processor is not None:
+                fault_line = self._seismic_guided_fault_interpolation(fg_points, self.current_slice)
+            else:
+                fault_line = self._fault_spline_interpolation(fg_points, h)
+            
+            print(f"Generated fault line with {len(fault_line)} points")
+            fault_mask = self._create_line_mask(fault_line, h, w)
+            return fault_mask, fault_line, 0.95
         else:
-            # Simple spline interpolation
-            horizon_line = self._spline_interpolation(fg_points, w)
-        
-        print(f"Generated horizon line with {len(horizon_line)} points")
-        
-        # Create thin line mask from horizon line
-        horizon_mask = self._create_line_mask(horizon_line, h, w)
-        
-        # Store horizon line for this object
-        confidence = 0.95  # High confidence when user provides points
-        
-        return horizon_mask, horizon_line, confidence
+            # HORIZON MODE (default)
+            # Sort points by x-coordinate for proper horizon interpolation
+            fg_points.sort(key=lambda p: p[0])
+            
+            print(f"HORIZON MODE: Creating horizon from {len(fg_points)} points")
+            
+            # Fit a smooth spline through the points
+            if use_seismic_guidance and self.attributes_processor is not None:
+                # Use seismic-guided interpolation
+                horizon_line = self._seismic_guided_interpolation(fg_points, self.current_slice)
+            else:
+                # Simple spline interpolation
+                horizon_line = self._spline_interpolation(fg_points, w)
+            
+            print(f"Generated horizon line with {len(horizon_line)} points")
+            
+            # Create thin line mask from horizon line
+            horizon_mask = self._create_line_mask(horizon_line, h, w)
+            
+            # Store horizon line for this object
+            confidence = 0.95  # High confidence when user provides points
+            
+            return horizon_mask, horizon_line, confidence
     
+    def _fault_spline_interpolation(self, points: List[Tuple[float, float]], 
+                                    height: int, smoothing: float = 0.1) -> List[Tuple[int, int]]:
+        """
+        Fit a smooth spline through fault points, interpolating along Y-axis.
+        
+        Args:
+            points: List of (x, y) coordinates - picked fault points (sorted by y)
+            height: Image height - fault will extend across this vertically
+            smoothing: Spline smoothing factor
+            
+        Returns:
+            List of (x, y) coordinates along the fault
+        """
+        if len(points) < 2:
+            return [(int(p[0]), int(p[1])) for p in points]
+        
+        # Extract x and y coordinates
+        xs = np.array([p[0] for p in points])
+        ys = np.array([p[1] for p in points])
+        
+        print(f"Fault spline: {len(points)} points, x range [{xs.min():.0f}, {xs.max():.0f}], y range [{ys.min():.0f}, {ys.max():.0f}]")
+        
+        # Get y range - DO NOT EXTEND beyond picked points for faults!
+        y_min, y_max = int(ys.min()), int(ys.max())
+        
+        # Only minimal extension (5 pixels) to smooth endpoints
+        y_min = max(0, y_min - 5)
+        y_max = min(height - 1, y_max + 5)
+        
+        try:
+            # Use parametric spline for potentially multi-valued function
+            if len(points) >= 4:
+                tck, u = splprep([xs, ys], s=len(points) * smoothing, k=min(3, len(points)-1))
+                u_new = np.linspace(0, 1, max(50, (y_max - y_min)))
+                x_new, y_new = splev(u_new, tck)
+            else:
+                # Linear interpolation for few points
+                y_new = np.linspace(ys.min(), ys.max(), max(20, int(ys.max() - ys.min()) + 1))
+                x_new = np.interp(y_new, ys, xs)
+            
+            # Create fault line points - within y range and valid x
+            fault_line = []
+            for x, y in zip(x_new, y_new):
+                xi, yi = int(round(x)), int(round(y))
+                # Check y is in range and x is valid (x should be >= 0, no upper bound needed here)
+                if y_min <= yi <= y_max and 0 <= xi:
+                    fault_line.append((xi, yi))
+            
+            print(f"Generated {len(fault_line)} fault line points")
+            return fault_line
+            
+        except Exception as e:
+            print(f"Fault spline interpolation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback: simple linear interpolation within range
+            y_range = np.linspace(ys.min(), ys.max(), max(20, int(ys.max() - ys.min()) + 1))
+            x_range = np.interp(y_range, ys, xs)
+            return [(int(x), int(y)) for x, y in zip(x_range, y_range)]
+    
+    def _seismic_guided_fault_interpolation(self, points: List[Tuple[float, float]],
+                                            slice_data: np.ndarray) -> List[Tuple[int, int]]:
+        """
+        Interpolate fault line using seismic guidance (vertical edges).
+        """
+        from scipy.ndimage import sobel, gaussian_filter
+        
+        h, w = slice_data.shape
+        
+        # Compute vertical edges (fault indicator)
+        smoothed = gaussian_filter(slice_data.astype(float), sigma=1)
+        vertical_edges = np.abs(sobel(smoothed, axis=1))  # Horizontal gradient = vertical edges
+        vertical_edges = vertical_edges / (vertical_edges.max() + 1e-10)
+        
+        # Get initial spline interpolation
+        initial_fault = self._fault_spline_interpolation(points, h)
+        
+        if len(initial_fault) == 0:
+            return initial_fault
+        
+        # Refine each point by snapping to nearby strong vertical edge
+        refined_fault = []
+        search_radius = 10
+        
+        for x, y in initial_fault:
+            # Search window
+            x_min = max(0, x - search_radius)
+            x_max = min(w, x + search_radius + 1)
+            
+            if x_max > x_min and 0 <= y < h:
+                # Find strongest edge in horizontal window at this y
+                edge_slice = vertical_edges[y, x_min:x_max]
+                
+                # Weight by distance from expected position
+                distances = np.abs(np.arange(len(edge_slice)) - (x - x_min))
+                weights = np.exp(-distances / 5.0)
+                scores = edge_slice * weights
+                
+                best_offset = np.argmax(scores)
+                new_x = x_min + best_offset
+                refined_fault.append((new_x, y))
+            else:
+                refined_fault.append((x, y))
+        
+        # Smooth the result
+        if len(refined_fault) > 5:
+            xs = np.array([p[0] for p in refined_fault])
+            ys = np.array([p[1] for p in refined_fault])
+            xs_smooth = gaussian_filter(xs.astype(float), sigma=2)
+            refined_fault = [(int(x), int(y)) for x, y in zip(xs_smooth, ys)]
+        
+        return refined_fault
+    
+    def _extract_fault_from_mask(self, mask: np.ndarray) -> List[Tuple[int, int]]:
+        """Extract a vertical/diagonal fault line from a blob mask."""
+        # Find the center x-coordinate at each y level
+        h, w = mask.shape
+        fault_line = []
+        
+        for y in range(h):
+            row = mask[y, :]
+            if np.any(row):
+                # Get center of mass for this row
+                xs = np.where(row)[0]
+                x_center = int(np.mean(xs))
+                fault_line.append((x_center, y))
+        
+        return fault_line
+
     def _spline_interpolation(self, points: List[Tuple[float, float]], 
                               width: int, smoothing: float = 0.1) -> List[Tuple[int, int]]:
         """
@@ -798,7 +972,7 @@ class SeismicPredictorSAM3:
     
     def get_horizon_line(self, obj_id: int, slice_type: str, slice_idx: int) -> Optional[List[Tuple[int, int]]]:
         """
-        Get stored horizon line for an object on a specific slice.
+        Get stored horizon/fault line for an object on a specific slice.
         
         Args:
             obj_id: Object ID
@@ -809,6 +983,9 @@ class SeismicPredictorSAM3:
             List of (x, y) coordinates or None if not found
         """
         slice_key = f"{slice_type}_{slice_idx}"
+        
+        # Check if this object is a fault
+        is_fault = self.fault_objects.get(obj_id, False)
         
         # First check explicit horizon_lines storage
         if obj_id in self.horizon_lines:
@@ -826,23 +1003,34 @@ class SeismicPredictorSAM3:
         # Try to extract from mask if available
         if obj_id in self.object_masks and slice_key in self.object_masks[obj_id]:
             mask = self.object_masks[obj_id][slice_key]
-            return self._extract_horizon_from_mask(mask)
+            if is_fault:
+                return self._extract_fault_from_mask(mask)
+            else:
+                return self._extract_horizon_from_mask(mask)
         
         # Try to extract from video_masks
         if hasattr(self, 'video_masks') and slice_idx in self.video_masks:
             if obj_id in self.video_masks[slice_idx]:
                 mask = self.video_masks[slice_idx][obj_id]
-                return self._extract_horizon_from_mask(mask)
+                if is_fault:
+                    return self._extract_fault_from_mask(mask)
+                else:
+                    return self._extract_horizon_from_mask(mask)
         
         return None
     
     def store_horizon_line(self, obj_id: int, slice_type: str, slice_idx: int, 
                           horizon_line: List[Tuple[int, int]]):
-        """Store a horizon line for later retrieval."""
+        """Store a horizon or fault line for later retrieval."""
         if obj_id not in self.horizon_lines:
             self.horizon_lines[obj_id] = {}
         slice_key = f"{slice_type}_{slice_idx}"
         self.horizon_lines[obj_id][slice_key] = horizon_line
+        
+        # Also record if this is a fault (based on current fault_mode)
+        # This will be used during propagation
+        self.fault_objects[obj_id] = self.fault_mode
+        print(f"Stored line for object {obj_id}, marked as {'FAULT' if self.fault_mode else 'HORIZON'}")
     
     def mask_to_horizon_line(self, mask: np.ndarray) -> List[Tuple[int, int]]:
         """
@@ -1072,7 +1260,7 @@ class SeismicPredictorSAM3:
         return best_idx
     
     def _demo_add_point_to_video(self, frame_idx, obj_id, points, labels):
-        """Demo mode add point - creates horizon line from points."""
+        """Demo mode add point - creates horizon or fault line from points."""
         if frame_idx not in self.video_masks:
             self.video_masks[frame_idx] = {}
         
@@ -1082,19 +1270,36 @@ class SeismicPredictorSAM3:
         fg_points = [(pt[0], pt[1]) for pt, lbl in zip(points, labels) if lbl == 1]
         
         if len(fg_points) >= 2:
-            # Create a horizon line through the points
-            horizon_line = self._spline_interpolation(fg_points, w)
-            mask = self._create_line_mask(horizon_line, h, w)
+            # Check if in fault mode - create fault line instead of horizon
+            if self.fault_mode:
+                print(f"FAULT MODE: Creating fault line from {len(fg_points)} points")
+                # Sort by Y for fault (vertical line)
+                fg_points_sorted = sorted(fg_points, key=lambda p: p[1])
+                line = self._fault_spline_interpolation(fg_points_sorted, h)
+                line_type = "fault"
+                # Mark this object as a fault
+                self.fault_objects[obj_id] = True
+            else:
+                print(f"HORIZON MODE: Creating horizon line from {len(fg_points)} points")
+                # Sort by X for horizon (horizontal line)
+                fg_points_sorted = sorted(fg_points, key=lambda p: p[0])
+                line = self._spline_interpolation(fg_points_sorted, w)
+                line_type = "horizon"
+                # Mark this object as NOT a fault
+                self.fault_objects[obj_id] = False
             
-            # Store both mask and horizon line
+            mask = self._create_line_mask(line, h, w)
+            
+            # Store both mask and line
             self.video_masks[frame_idx][obj_id] = mask
                 
-            # Store horizon line for later retrieval
+            # Store line for later retrieval
             if obj_id not in self.horizon_lines:
                 self.horizon_lines[obj_id] = {}
             slice_key = f"{self.current_slice_type}_{frame_idx}"
-            self.horizon_lines[obj_id][slice_key] = horizon_line
-            print(f"Demo mode: stored horizon line with {len(horizon_line)} points for frame {frame_idx}")
+            self.horizon_lines[obj_id][slice_key] = line
+            print(f"Demo mode: stored {line_type} line with {len(line)} points for frame {frame_idx}")
+            print(f"  Object {obj_id} marked as {'FAULT' if self.fault_objects.get(obj_id) else 'HORIZON'}")
         
         return True
 
@@ -1399,6 +1604,21 @@ class SeismicPredictorSAM3:
             print(f"  Could not store tracking templates: {e}")
             self._tracking_templates = None
         
+        # Check if this object is a fault using stored flag (more reliable than line detection)
+        # First check the stored fault_objects dictionary
+        if obj_id in self.fault_objects:
+            is_fault = self.fault_objects[obj_id]
+            print(f"  Object {obj_id} is marked as {'FAULT' if is_fault else 'HORIZON'} in fault_objects")
+        else:
+            # Fallback: detect from line orientation
+            is_fault = self._is_fault_line(initial_horizon_line)
+            print(f"  Detected from line shape: {'FAULT' if is_fault else 'HORIZON'}")
+        
+        if is_fault:
+            print(f"  Using FAULT tracking (vertical edges, confined)")
+        else:
+            print(f"  Using HORIZON tracking (horizontal reflectors)")
+        
         # Store the initial horizon at its slice index
         if initial_slice_idx in slice_indices:
             horizon_mask = self._create_line_mask(initial_horizon_line, h, w)
@@ -1413,11 +1633,11 @@ class SeismicPredictorSAM3:
         backward_slices.sort(reverse=True)
         
         # SIMPLE INCREMENTAL TRACKING - each slice uses previous as base
-        # This allows natural drift following the horizon
+        # This allows natural drift following the horizon/fault
         
         # Process forward direction
         print(f"  Processing {len(forward_slices)} forward slices...")
-        current_horizon = initial_horizon_line
+        current_line = initial_horizon_line
         
         for i, idx in enumerate(forward_slices):
             try:
@@ -1428,19 +1648,24 @@ class SeismicPredictorSAM3:
                 else:
                     slice_data = self.seismic_volume.get_timeslice(idx)
                 
-                # Propagate from PREVIOUS slice (incremental)
-                propagated_horizon = self._propagate_horizon_to_slice(
-                    current_horizon, 1, slice_data, h, w
-                )
-                current_horizon = propagated_horizon  # Update for next iteration
+                # Use appropriate propagation based on line type
+                if is_fault:
+                    propagated_line = self._propagate_fault_to_slice(
+                        current_line, 1, slice_data, h, w
+                    )
+                else:
+                    propagated_line = self._propagate_horizon_to_slice(
+                        current_line, 1, slice_data, h, w
+                    )
+                current_line = propagated_line  # Update for next iteration
                 
             except Exception as e:
-                propagated_horizon = current_horizon
+                propagated_line = current_line
             
             # Store result
-            horizon_mask = self._create_line_mask(propagated_horizon, h, w)
-            state['inference_state']['output'][idx] = horizon_mask
-            state['inference_state']['horizon_lines'][idx] = propagated_horizon
+            line_mask = self._create_line_mask(propagated_line, h, w)
+            state['inference_state']['output'][idx] = line_mask
+            state['inference_state']['horizon_lines'][idx] = propagated_line
             
             # Progress update every 100 slices
             if (i + 1) % 100 == 0:
@@ -1448,7 +1673,7 @@ class SeismicPredictorSAM3:
         
         # Process backward direction
         print(f"  Processing {len(backward_slices)} backward slices...")
-        current_horizon = initial_horizon_line
+        current_line = initial_horizon_line
         
         for i, idx in enumerate(backward_slices):
             try:
@@ -1459,18 +1684,23 @@ class SeismicPredictorSAM3:
                 else:
                     slice_data = self.seismic_volume.get_timeslice(idx)
                 
-                propagated_horizon = self._propagate_horizon_to_slice(
-                    current_horizon, -1, slice_data, h, w
-                )
-                current_horizon = propagated_horizon
+                if is_fault:
+                    propagated_line = self._propagate_fault_to_slice(
+                        current_line, -1, slice_data, h, w
+                    )
+                else:
+                    propagated_line = self._propagate_horizon_to_slice(
+                        current_line, -1, slice_data, h, w
+                    )
+                current_line = propagated_line
                 
             except Exception as e:
-                propagated_horizon = current_horizon
+                propagated_line = current_line
             
             # Store result
-            horizon_mask = self._create_line_mask(propagated_horizon, h, w)
-            state['inference_state']['output'][idx] = horizon_mask
-            state['inference_state']['horizon_lines'][idx] = propagated_horizon
+            line_mask = self._create_line_mask(propagated_line, h, w)
+            state['inference_state']['output'][idx] = line_mask
+            state['inference_state']['horizon_lines'][idx] = propagated_line
             
             # Progress update every 100 slices
             if (i + 1) % 100 == 0:
@@ -1579,6 +1809,127 @@ class SeismicPredictorSAM3:
             ys = np.array([p[1] for p in propagated])
             ys_smooth = gaussian_filter1d(ys.astype(float), sigma=2)
             propagated = [(int(x), int(np.clip(y, 0, height-1))) for x, y in zip(xs, ys_smooth)]
+        
+        return propagated
+    
+    def _is_fault_line(self, line: List[Tuple[int, int]]) -> bool:
+        """
+        Detect if a line is a fault (vertical/diagonal) or horizon (horizontal).
+        
+        A fault has more variation in X than Y (spans more vertically than horizontally).
+        A horizon has more variation in X than Y (spans more horizontally).
+        """
+        if len(line) < 2:
+            return False
+        
+        xs = [p[0] for p in line]
+        ys = [p[1] for p in line]
+        
+        x_range = max(xs) - min(xs)
+        y_range = max(ys) - min(ys)
+        
+        # If Y range is greater than X range, it's more vertical = fault
+        # Using a threshold to account for slightly dipping horizons
+        if y_range > x_range * 0.5:  # If y_range > 50% of x_range, consider it a fault
+            return True
+        return False
+    
+    def _propagate_fault_to_slice(self, base_fault: List[Tuple[int, int]], 
+                                   slice_offset: int,
+                                   slice_data: np.ndarray,
+                                   height: int, width: int) -> List[Tuple[int, int]]:
+        """
+        Propagate a fault line to a new slice using seismic guidance.
+        
+        For faults, we track along vertical edges (discontinuities).
+        The fault stays CONFINED to its original Y-range.
+        
+        Args:
+            base_fault: The reference fault line [(x, y), ...]
+            slice_offset: Number of slices from the reference
+            slice_data: The seismic data for the target slice
+            height, width: Dimensions of the target slice
+            
+        Returns:
+            Propagated fault line for the target slice
+        """
+        if not base_fault:
+            return []
+        
+        from scipy.ndimage import sobel, gaussian_filter, gaussian_filter1d
+        
+        # Compute vertical edges (fault indicator) - use horizontal derivative
+        smoothed = gaussian_filter(slice_data.astype(float), sigma=1.5)
+        vertical_edges = np.abs(sobel(smoothed, axis=1))  # Horizontal derivative = vertical edges
+        
+        # Normalize to 0-1 range
+        v_max = vertical_edges.max()
+        if v_max > 0:
+            vertical_edges = vertical_edges / v_max
+        
+        # Also compute amplitude discontinuity (faults show amplitude changes across them)
+        # Use a slightly wider derivative to catch the discontinuity
+        amp_diff = np.abs(np.roll(smoothed, -3, axis=1) - np.roll(smoothed, 3, axis=1))
+        amp_max = amp_diff.max()
+        if amp_max > 0:
+            amp_diff = amp_diff / amp_max
+        
+        # Combine indicators - vertical edges are primary, amplitude is secondary
+        fault_indicator = 0.6 * vertical_edges + 0.4 * amp_diff
+        
+        # Parameters for fault tracking
+        search_window = 15  # Search window for fault position
+        
+        propagated = []
+        prev_x = None
+        
+        # Get the y-range from the base fault (we stay within this range)
+        base_ys = [p[1] for p in base_fault]
+        y_min_orig = min(base_ys)
+        y_max_orig = max(base_ys)
+        
+        for x, y in base_fault:
+            x, y = int(x), int(y)
+            if y < 0 or y >= height:
+                continue
+            
+            # Search for best fault position horizontally at this y level
+            x_min = max(0, x - search_window)
+            x_max = min(width, x + search_window + 1)
+            
+            if x_max <= x_min:
+                new_x = x
+            else:
+                # Get fault indicator strength in horizontal window
+                window = fault_indicator[y, x_min:x_max]
+                
+                # Weight by distance from expected position (prefer staying close)
+                distances = np.abs(np.arange(len(window)) - (x - x_min))
+                weights = np.exp(-distances / 5.0)
+                
+                # Combined score
+                scores = window * weights
+                
+                # Find best position
+                best_idx = np.argmax(scores)
+                new_x = x_min + best_idx
+            
+            # Smoothness constraint: limit horizontal jump
+            if prev_x is not None:
+                max_jump = 3  # Allow some movement but not too much
+                if abs(new_x - prev_x) > max_jump:
+                    new_x = int(prev_x + np.sign(new_x - prev_x) * max_jump)
+            
+            new_x = int(np.clip(new_x, 0, width - 1))
+            propagated.append((new_x, y))
+            prev_x = new_x
+        
+        # Apply light smoothing to x coordinates
+        if len(propagated) > 5:
+            xs = np.array([p[0] for p in propagated])
+            ys = [p[1] for p in propagated]
+            xs_smooth = gaussian_filter1d(xs.astype(float), sigma=1.5)
+            propagated = [(int(np.clip(x, 0, width-1)), int(y)) for x, y in zip(xs_smooth, ys)]
         
         return propagated
     
@@ -2225,3 +2576,365 @@ class SeismicPredictorSAM3:
         # Clear GPU memory
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    # ==================== FAULT DETECTION METHODS ====================
+    
+    def detect_faults_on_slice(self, slice_data: np.ndarray = None, 
+                               slice_idx: int = None,
+                               threshold: float = 0.4,
+                               min_length: int = 20) -> Dict:
+        """
+        Detect faults on the current or specified slice.
+        
+        Args:
+            slice_data: Seismic slice data (uses current_slice if None)
+            slice_idx: Slice index (uses current_slice_idx if None)
+            threshold: Fault likelihood threshold (0-1)
+            min_length: Minimum fault line length in pixels
+            
+        Returns:
+            Dictionary with fault detection results
+        """
+        if slice_data is None:
+            slice_data = self.current_slice
+        
+        if slice_idx is None:
+            slice_idx = self.current_slice_idx
+        
+        if slice_data is None:
+            print("No slice data available for fault detection")
+            return {}
+        
+        # Ensure we have the attributes processor
+        if self.attributes_processor is None:
+            from seismic_attributes import SeismicAttributes
+            self.attributes_processor = SeismicAttributes(use_gpu=torch.cuda.is_available())
+        
+        print(f"Detecting faults on slice {slice_idx}...")
+        
+        # Use the SeismicAttributes fault detection
+        result = self.attributes_processor.detect_faults(
+            slice_data, 
+            threshold=threshold,
+            min_length=min_length
+        )
+        
+        # Store results
+        slice_key = f"{self.current_slice_type}_{slice_idx}"
+        self.detected_faults[slice_key] = result
+        
+        print(f"Detected {result['num_faults']} faults on {slice_key}")
+        
+        return result
+    
+    def detect_faults_on_volume(self, threshold: float = 0.4,
+                                min_length: int = 20,
+                                slice_range: Tuple[int, int] = None) -> Dict:
+        """
+        Detect faults across multiple slices.
+        
+        Args:
+            threshold: Fault likelihood threshold
+            min_length: Minimum fault line length
+            slice_range: (start, end) slice range, or None for all
+            
+        Returns:
+            Summary of detected faults
+        """
+        if self.seismic_volume is None:
+            print("No seismic volume loaded")
+            return {}
+        
+        # Determine slice range
+        if slice_range is None:
+            if self.current_slice_type == "inline":
+                total_slices = len(self.seismic_volume.inlines) if hasattr(self.seismic_volume, 'inlines') else 100
+            elif self.current_slice_type == "crossline":
+                total_slices = len(self.seismic_volume.crosslines) if hasattr(self.seismic_volume, 'crosslines') else 100
+            else:
+                total_slices = 100
+            slice_range = (0, total_slices)
+        
+        start_idx, end_idx = slice_range
+        total_faults = 0
+        
+        print(f"Detecting faults from slice {start_idx} to {end_idx}...")
+        
+        for idx in range(start_idx, end_idx):
+            try:
+                # Get slice data
+                if self.current_slice_type == "inline":
+                    slice_data = self.seismic_volume.get_inline_slice(idx)
+                elif self.current_slice_type == "crossline":
+                    slice_data = self.seismic_volume.get_crossline_slice(idx)
+                else:
+                    slice_data = self.seismic_volume.get_timeslice(idx)
+                
+                result = self.detect_faults_on_slice(slice_data, idx, threshold, min_length)
+                total_faults += result.get('num_faults', 0)
+                
+            except Exception as e:
+                print(f"Error detecting faults on slice {idx}: {e}")
+        
+        print(f"Fault detection complete: {total_faults} faults detected across {end_idx - start_idx} slices")
+        
+        return {
+            'total_faults': total_faults,
+            'slice_range': slice_range
+        }
+    
+    def add_fault_pick(self, x: int, y: int, fault_id: int = None) -> int:
+        """
+        Add a point to a user-defined fault.
+        
+        Args:
+            x, y: Point coordinates
+            fault_id: Fault ID to add to (creates new if None)
+            
+        Returns:
+            Fault ID
+        """
+        if fault_id is None:
+            fault_id = self.current_fault_id
+        
+        slice_key = f"{self.current_slice_type}_{self.current_slice_idx}"
+        
+        if fault_id not in self.fault_picks:
+            self.fault_picks[fault_id] = {}
+        
+        if slice_key not in self.fault_picks[fault_id]:
+            self.fault_picks[fault_id][slice_key] = []
+        
+        self.fault_picks[fault_id][slice_key].append((x, y))
+        
+        print(f"Added fault pick ({x}, {y}) to fault {fault_id} on {slice_key}")
+        
+        return fault_id
+    
+    def fit_fault_line(self, fault_id: int, slice_key: str = None) -> List[Tuple[int, int]]:
+        """
+        Fit a smooth line through user-picked fault points.
+        
+        Args:
+            fault_id: Fault ID
+            slice_key: Slice key (uses current if None)
+            
+        Returns:
+            List of (x, y) points for the fault line
+        """
+        if slice_key is None:
+            slice_key = f"{self.current_slice_type}_{self.current_slice_idx}"
+        
+        if fault_id not in self.fault_picks or slice_key not in self.fault_picks[fault_id]:
+            return []
+        
+        points = self.fault_picks[fault_id][slice_key]
+        
+        if len(points) < 2:
+            return points
+        
+        # Sort by y coordinate (faults typically go top to bottom)
+        points = sorted(points, key=lambda p: p[1])
+        
+        if len(points) >= 4:
+            # Fit spline
+            try:
+                xs = np.array([p[0] for p in points])
+                ys = np.array([p[1] for p in points])
+                
+                # Use parameterized spline
+                tck, u = splprep([xs, ys], s=len(points) * 2, k=min(3, len(points) - 1))
+                
+                # Generate smooth line
+                u_new = np.linspace(0, 1, max(50, len(points) * 5))
+                x_new, y_new = splev(u_new, tck)
+                
+                return [(int(x), int(y)) for x, y in zip(x_new, y_new)]
+                
+            except Exception as e:
+                print(f"Spline fitting failed: {e}")
+                return points
+        else:
+            # Simple linear interpolation for few points
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            
+            # Interpolate
+            y_range = np.linspace(min(ys), max(ys), 50)
+            x_range = np.interp(y_range, ys, xs)
+            
+            return [(int(x), int(y)) for x, y in zip(x_range, y_range)]
+    
+    def snap_fault_to_edges(self, fault_points: List[Tuple[int, int]], 
+                           slice_data: np.ndarray = None,
+                           search_radius: int = 10) -> List[Tuple[int, int]]:
+        """
+        Snap fault points to nearby strong edges in the seismic data.
+        
+        Args:
+            fault_points: Initial fault line points
+            slice_data: Seismic data (uses current_slice if None)
+            search_radius: Radius to search for edges
+            
+        Returns:
+            Snapped fault line points
+        """
+        if slice_data is None:
+            slice_data = self.current_slice
+        
+        if slice_data is None or len(fault_points) == 0:
+            return fault_points
+        
+        from scipy.ndimage import sobel, gaussian_filter
+        
+        # Compute vertical edges (faults are often vertical/diagonal)
+        smoothed = gaussian_filter(slice_data.astype(float), sigma=1)
+        vertical_edges = np.abs(sobel(smoothed, axis=1))
+        vertical_edges = vertical_edges / (vertical_edges.max() + 1e-10)
+        
+        height, width = slice_data.shape
+        snapped = []
+        
+        for x, y in fault_points:
+            # Search for strongest edge nearby
+            x_min = max(0, x - search_radius)
+            x_max = min(width, x + search_radius + 1)
+            y_min = max(0, y - search_radius)
+            y_max = min(height, y + search_radius + 1)
+            
+            window = vertical_edges[y_min:y_max, x_min:x_max]
+            
+            if window.size > 0:
+                # Find local maximum
+                max_idx = np.unravel_index(np.argmax(window), window.shape)
+                best_y = y_min + max_idx[0]
+                best_x = x_min + max_idx[1]
+                snapped.append((best_x, best_y))
+            else:
+                snapped.append((x, y))
+        
+        return snapped
+    
+    def get_fault_overlay(self, slice_idx: int = None) -> Optional[np.ndarray]:
+        """
+        Get fault overlay for display.
+        
+        Args:
+            slice_idx: Slice index (uses current if None)
+            
+        Returns:
+            RGBA overlay array or None
+        """
+        if slice_idx is None:
+            slice_idx = self.current_slice_idx
+        
+        slice_key = f"{self.current_slice_type}_{slice_idx}"
+        
+        if self.current_slice is None:
+            return None
+        
+        h, w = self.current_slice.shape
+        overlay = np.zeros((h, w, 4), dtype=np.float32)
+        
+        has_content = False
+        
+        # Add detected faults (red) - only if show_faults is enabled
+        if self.show_faults and slice_key in self.detected_faults:
+            fault_data = self.detected_faults[slice_key]
+            has_content = True
+            
+            # Show fault likelihood as semi-transparent red
+            if 'fault_likelihood' in fault_data:
+                likelihood = fault_data['fault_likelihood']
+                # Threshold the likelihood for clearer display
+                likelihood_display = np.where(likelihood > 0.2, likelihood, 0)
+                overlay[:, :, 0] = likelihood_display  # Red channel
+                overlay[:, :, 3] = likelihood_display * 0.5  # Alpha
+            
+            # Draw fault lines as solid red with thickness
+            if 'fault_lines' in fault_data:
+                for fault_line in fault_data['fault_lines']:
+                    for x, y in fault_line:
+                        # Draw with thickness
+                        for dx in range(-2, 3):
+                            for dy in range(-2, 3):
+                                px, py = x + dx, y + dy
+                                if 0 <= px < w and 0 <= py < h:
+                                    overlay[py, px, 0] = 1.0  # Red
+                                    overlay[py, px, 3] = 1.0  # Full alpha
+        
+        # Add user-picked faults (yellow) - ALWAYS show when in fault mode or show_faults
+        if self.fault_mode or self.show_faults:
+            for fault_id, slices in self.fault_picks.items():
+                if slice_key in slices:
+                    points = slices[slice_key]
+                    
+                    if len(points) > 0:
+                        has_content = True
+                    
+                    # Draw points as yellow circles
+                    for x, y in points:
+                        if 0 <= x < w and 0 <= y < h:
+                            # Draw a circle with radius 5
+                            for dx in range(-5, 6):
+                                for dy in range(-5, 6):
+                                    if dx*dx + dy*dy <= 25:
+                                        px, py = x + dx, y + dy
+                                        if 0 <= px < w and 0 <= py < h:
+                                            overlay[py, px, 0] = 1.0  # Red
+                                            overlay[py, px, 1] = 1.0  # Green = Yellow
+                                            overlay[py, px, 2] = 0.0  # No blue
+                                            overlay[py, px, 3] = 1.0  # Full alpha
+                    
+                    # Draw fitted line (bright yellow/orange)
+                    if len(points) >= 2:
+                        fitted = self.fit_fault_line(fault_id, slice_key)
+                        for x, y in fitted:
+                            # Draw line with thickness
+                            for dx in range(-2, 3):
+                                for dy in range(-2, 3):
+                                    px, py = x + dx, y + dy
+                                    if 0 <= px < w and 0 <= py < h:
+                                        overlay[py, px, 0] = 1.0  # Red
+                                        overlay[py, px, 1] = 0.6  # Some green = orange
+                                        overlay[py, px, 2] = 0.0
+                                        overlay[py, px, 3] = 0.9
+        
+        if not has_content:
+            return None
+            
+        return overlay
+    
+    def clear_fault_picks(self, fault_id: int = None):
+        """Clear user-picked fault points."""
+        if fault_id is None:
+            self.fault_picks.clear()
+            print("Cleared all fault picks")
+        else:
+            if fault_id in self.fault_picks:
+                del self.fault_picks[fault_id]
+                print(f"Cleared fault {fault_id}")
+    
+    def new_fault(self) -> int:
+        """Start a new fault and return its ID."""
+        self.current_fault_id += 1
+        print(f"Starting new fault with ID {self.current_fault_id}")
+        return self.current_fault_id
+    
+    def get_fault_statistics(self) -> Dict:
+        """Get statistics about detected and picked faults."""
+        stats = {
+            'detected_slices': len(self.detected_faults),
+            'picked_faults': len(self.fault_picks),
+            'total_detected_lines': 0,
+            'total_picked_points': 0
+        }
+        
+        for slice_key, data in self.detected_faults.items():
+            stats['total_detected_lines'] += data.get('num_faults', 0)
+        
+        for fault_id, slices in self.fault_picks.items():
+            for slice_key, points in slices.items():
+                stats['total_picked_points'] += len(points)
+        
+        return stats
